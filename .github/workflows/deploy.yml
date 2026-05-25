@@ -11,20 +11,20 @@ jobs:
         run: |
           curl -X POST \
             -H "Authorization: Token ${{ secrets.PA_API_TOKEN }}" \
-            "https://www.pythonanywhere.com/api/v0/user/YOUR_USERNAME/webapps/YOUR_USERNAME.pythonanywhere.com/"
+            "https://www.pythonanywhere.com/api/v0/user/CodyCBakerPhD/webapps/pose-zoo-CodyCBakerPhD.pythonanywhere.com/"
 
-      - name: SSH and git pull
+      - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.0
         with:
           host: ssh.pythonanywhere.com
-          username: ${{ secrets.PA_USERNAME }}
-          password: ${{ secrets.PA_PASSWORD }}
+          username: CodyCBakerPhD
+          key: ${{ secrets.PA_SSH_KEY }}
           script: |
             cd ~/your-project
             git pull origin main
-            
+
       - name: Reload webapp
         run: |
           curl -X POST \
             -H "Authorization: Token ${{ secrets.PA_API_TOKEN }}" \
-            "https://www.pythonanywhere.com/api/v0/user/YOUR_USERNAME/webapps/YOUR_USERNAME.pythonanywhere.com/reload/"
+            "https://www.pythonanywhere.com/api/v0/user/CodyCBakerPhD/webapps/pose-zoo-CodyCBakerPhD..pythonanywhere.com/reload/"
