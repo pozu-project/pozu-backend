@@ -13,7 +13,7 @@ The tracked file `pozu-codycbakerphd_pythonanywhere_com_wsgi.py` is placed at `/
 
 The main Flask app is imported from `/home/CodyCBakerPhD/mysite/pozu_flask_app.py`.
 
-The virtual environment is configured on the app to read from `/home/CodyCBakerPhD/.virtualenvs/pose-zoo`, though the app also had to set some `PATH` values correspondingly to get `subprocess` to work correctly.
+The virtual environment is configured on the app to read from `/home/CodyCBakerPhD/.virtualenvs/pozu`, though the app also had to set some `PATH` values correspondingly to get `subprocess` to work correctly.
 
 That environment was set up using:
 
