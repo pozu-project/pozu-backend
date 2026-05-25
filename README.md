@@ -5,7 +5,7 @@ Backend Flask server for the Pose Zoo web app.
 
 ### Setup
 
-Backend is currently deployed using [PythonAnywhere by Anaconda].
+Backend is currently deployed using [PythonAnywhere by Anaconda](https://www.pythonanywhere.com/).
 
 Swagger: https://pozu-codycbakerphd.pythonanywhere.com/api/v1/docs
 
