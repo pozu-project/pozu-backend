@@ -11,7 +11,7 @@ Swagger: https://pozu-codycbakerphd.pythonanywhere.com/api/v1/docs
 
 The tracked file `pozu-codycbakerphd_pythonanywhere_com_wsgi.py` is placed at `/var/www/pozu-codycbakerphd_pythonanywhere_com_wsgi.py` until a custom domain is set up.
 
-The main Flask app is imported from `/home/CodyCBakerPhD/mysite/pozu_flask_app.py`.
+The main Flask app is imported from `/home/CodyCBakerPhD/mysite/pozu-backend/pozu_flask_app.py`.
 
 The virtual environment is configured on the app to read from `/home/CodyCBakerPhD/.virtualenvs/pozu`, though the app also had to set some `PATH` values correspondingly to get `subprocess` to work correctly.
 
