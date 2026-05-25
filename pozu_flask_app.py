@@ -9,6 +9,8 @@ Check `/api/v1/docs` for API reference.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import os
@@ -21,7 +23,6 @@ import pathlib
 import flask
 import flask_cors
 import flask_restx
-import werkzeug.datastructures
 
 # =============================================================================
 # Config
@@ -200,27 +201,22 @@ class BBoxAnnotation(flask_restx.Resource):
 
 labels_ns = flask_restx.Namespace("annotations-labels", description="SLEAP .slp labels uploads")
 
-upload_parser = flask_restx.reqparse.RequestParser()
-upload_parser.add_argument(
-    "file",
-    location="files",
-    type=werkzeug.datastructures.FileStorage,
-    required=True,
-    help="The .slp file produced by SLEAP",
-)
-upload_parser.add_argument(
-    "video_url",
-    location="form",
-    type=str,
-    required=True,
-    help="Blob URL of the source video; trailing segment is the content-id.",
+labels_request = labels_ns.model(
+    "LabelsAnnotation",
+    {
+        "video_url": flask_restx.fields.String(required=True),
+        "labels_file_content": flask_restx.fields.String(
+            required=True,
+            description="Base64-encoded bytes of the .slp file produced by SLEAP",
+        ),
+    },
 )
 
 labels_response = labels_ns.model(
     "LabelsAnnotationResponse",
     {
         "content_id": flask_restx.fields.String,
-        "labels_file_path": flask_restx.fields.String,
+        "labels_file_content": flask_restx.fields.String,
         "submission_id": flask_restx.fields.String,
         "push_status": flask_restx.fields.String,
         "push_message": flask_restx.fields.String,
@@ -230,29 +226,36 @@ labels_response = labels_ns.model(
 
 @labels_ns.route("")
 class LabelsAnnotation(flask_restx.Resource):
-    @labels_ns.expect(upload_parser)
+    @labels_ns.expect(labels_request, validate=False)
     @labels_ns.marshal_with(labels_response, code=http.HTTPStatus.ACCEPTED)
     def post(self):
         """Store a SLEAP .slp file and push to DANDI."""
-        args = upload_parser.parse_args()
-        upload: werkzeug.datastructures.FileStorage = args["file"]
-        video_url: str = args["video_url"]
+        body = flask.request.get_json(silent=True)
+        if not isinstance(body, dict):
+            raise BadRequest("Request body must be a JSON object")
+
+        video_url = body["video_url"]
 
         content_id = video_url.rsplit("/", maxsplit=1)[-1]
         if content_id not in CONTENT_ID_TO_DANDI_PATH:
             raise BadRequest(f"Unknown content_id: {content_id}")
 
+        try:
+            labels_file_bytes = base64.b64decode(body["labels_file_content"], validate=True)
+        except (binascii.Error, TypeError) as exc:
+            raise BadRequest("labels_file_content must be valid base64-encoded bytes") from exc
+
         submission_id = uuid.uuid4().hex
         labels_file_path = LABELS_DANDISET_ROOT / "derivatives" / "incoming" / f"id-{submission_id}.slp"
         labels_file_path.parent.mkdir(parents=True, exist_ok=True)
-        upload.save(labels_file_path)
-        logger.info("Wrote labels SLP -> %s", labels_file_path)
+        labels_file_path.write_bytes(labels_file_bytes)
+        logger.info("Wrote labels SLP (%d bytes) -> %s", len(labels_file_bytes), labels_file_path)
 
         rc, stdout, stderr = dandi_upload(file_path=labels_file_path, dandiset_root=LABELS_DANDISET_ROOT)
 
         return {
             "content_id": content_id,
-            "labels_file_path": str(labels_file_path),
+            "labels_file_content": body["labels_file_content"],
             "submission_id": submission_id,
             "push_status": "succeeded" if rc == 0 else "failed",
         }, http.HTTPStatus.ACCEPTED
