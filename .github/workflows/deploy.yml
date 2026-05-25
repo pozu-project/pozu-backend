@@ -17,7 +17,7 @@ jobs:
         uses: appleboy/ssh-action@v1.0.0
         with:
           host: ssh.pythonanywhere.com
-          username: YOUR_PA_USERNAME
+          username: CodyCBakerPhD
           key: ${{ secrets.PA_SSH_KEY }}
           script: |
             cd ~/your-project
