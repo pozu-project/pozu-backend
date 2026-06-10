@@ -9,8 +9,6 @@ Check `/api/v1/docs` for API reference.
 
 from __future__ import annotations
 
-import base64
-import binascii
 import datetime
 import json
 import logging
@@ -186,16 +184,30 @@ class BBoxAnnotation(flask_restx.Resource):
 # =============================================================================
 
 
-labels_ns = flask_restx.Namespace("annotations-labels", description="SLEAP labels uploads")
+labels_ns = flask_restx.Namespace("annotations-labels", description="Keypoint label annotations")
+
+keypoint_model = labels_ns.model(
+    "Keypoint",
+    {
+        "id": flask_restx.fields.String(required=True, description="Machine identifier, e.g. 'left_front_paw'"),
+        "name": flask_restx.fields.String(required=True, description="Human-readable label name"),
+        "placed": flask_restx.fields.Boolean(required=True, description="Whether the keypoint was placed by the user"),
+        "pixel_x": flask_restx.fields.Float(required=True, description="X coordinate in pixels"),
+        "pixel_y": flask_restx.fields.Float(required=True, description="Y coordinate in pixels"),
+    },
+)
 
 labels_request = labels_ns.model(
     "LabelsAnnotation",
     {
         "video_url": flask_restx.fields.String(required=True),
-        "labels_file_content": flask_restx.fields.String(
-            required=True,
-            description="Base64-encoded bytes of the .slp file produced by SLEAP",
-        ),
+        "frame_index": flask_restx.fields.Integer(required=True, min=0),
+        "total_frames": flask_restx.fields.Integer(required=True, min=1),
+        "fps": flask_restx.fields.Float(required=True, min=0),
+        "frame_width": flask_restx.fields.Integer(required=True, min=1),
+        "frame_height": flask_restx.fields.Integer(required=True, min=1),
+        "timestamp": flask_restx.fields.String(required=True),
+        "labels": flask_restx.fields.List(flask_restx.fields.Nested(keypoint_model), required=True),
     },
 )
 
@@ -204,8 +216,14 @@ labels_record = labels_ns.model(
     {
         "submission_id": flask_restx.fields.String(description="UUID hex identifying this submission"),
         "content_id": flask_restx.fields.String(description="Asset identifier extracted from video_url"),
-        "video_url": flask_restx.fields.String(description="Source video URL"),
-        "labels_file_content": flask_restx.fields.String(description="Base64-encoded .slp file bytes"),
+        "video_url": flask_restx.fields.String,
+        "frame_index": flask_restx.fields.Integer,
+        "total_frames": flask_restx.fields.Integer,
+        "fps": flask_restx.fields.Float,
+        "frame_width": flask_restx.fields.Integer,
+        "frame_height": flask_restx.fields.Integer,
+        "timestamp": flask_restx.fields.String,
+        "labels": flask_restx.fields.List(flask_restx.fields.Nested(keypoint_model)),
     },
 )
 
@@ -224,7 +242,7 @@ class LabelsAnnotation(flask_restx.Resource):
     @labels_ns.expect(labels_request, validate=False)
     @labels_ns.marshal_with(labels_response, code=http.HTTPStatus.ACCEPTED)
     def post(self):
-        """Queue a SLEAP labels submission for the next hourly DANDI upload."""
+        """Queue a keypoint label annotation for the next hourly DANDI upload."""
         body = flask.request.get_json(silent=True)
         if not isinstance(body, dict):
             raise BadRequest("Request body must be a JSON object")
@@ -234,18 +252,11 @@ class LabelsAnnotation(flask_restx.Resource):
         if content_id not in CONTENT_ID_TO_DANDI_PATH:
             raise BadRequest(f"Unknown content_id: {content_id}")
 
-        try:
-            base64.b64decode(body["labels_file_content"], validate=True)
-        except (binascii.Error, TypeError) as exc:
-            raise BadRequest("labels_file_content must be valid base64-encoded bytes") from exc
+        if not isinstance(body.get("labels"), list):
+            raise BadRequest("'labels' must be a list of keypoint objects")
 
         submission_id = uuid.uuid4().hex
-        record: dict = {
-            "submission_id": submission_id,
-            "content_id": content_id,
-            "video_url": video_url,
-            "labels_file_content": body["labels_file_content"],
-        }
+        record: dict = {"submission_id": submission_id, "content_id": content_id, **body}
 
         buffer_dir = LABELS_DANDISET_ROOT / "derivatives" / "buffer"
         append_to_hourly_jsonl(record, buffer_dir)
