@@ -9,17 +9,16 @@ Check `/api/v1/docs` for API reference.
 
 from __future__ import annotations
 
-import base64
-import binascii
+import datetime
 import json
 import logging
 import os
-import subprocess
+import pathlib
 import sys
 import uuid
 import http
-import pathlib
 
+import filelock
 import flask
 import flask_cors
 import flask_restx
@@ -85,34 +84,26 @@ _handler.addFilter(RedactFilter([EMBER_DANDI_API_KEY]))
 
 
 # =============================================================================
-# Helper: invoke `dandi upload` for a file inside the dandiset
+# Helper: append a record to the current hour's JSONL buffer file
 # =============================================================================
 
 
-def dandi_upload(*, file_path: pathlib.Path, dandiset_root: pathlib.Path) -> tuple[int, str, str]:
-    """Upload `file_path` to the configured DANDI instance. Returns (rc, stdout, stderr)."""
-    env = os.environ.copy()
-    env["EMBER_DANDI_API_KEY"] = EMBER_DANDI_API_KEY
-    env["PATH"] = f"{VENV_BIN}:{env.get('PATH', '')}"
+def append_to_hourly_jsonl(record: dict, buffer_dir: pathlib.Path) -> pathlib.Path:
+    """Append *record* as a JSON line to the current-hour JSONL buffer.
 
-    cmd = [DANDI_BIN, "upload", "--dandi-instance", DANDI_INSTANCE]
-    logger.info("Running: %s (cwd=%s)", " ".join(cmd), dandiset_root)
-    proc = subprocess.run(
-        cmd,
-        cwd=dandiset_root,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    logger.info(
-        "dandi upload rc=%d\nstdout: %s\nstderr: %s",
-        proc.returncode,
-        proc.stdout,
-        proc.stderr,
-    )
-    return proc.returncode, proc.stdout, proc.stderr
+    Uses a per-file lock so concurrent WSGI workers don't interleave writes.
+    Returns the path of the JSONL file written to.
+    """
+    hour_tag = datetime.datetime.utcnow().strftime("%Y-%m-%d-%H")
+    buffer_dir.mkdir(parents=True, exist_ok=True)
+    jsonl_path = buffer_dir / f"{hour_tag}.jsonl"
+    lock_path = buffer_dir / f"{hour_tag}.jsonl.lock"
+
+    with filelock.FileLock(lock_path):
+        with jsonl_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, sort_keys=True) + "\n")
+
+    return jsonl_path
 
 
 # =============================================================================
@@ -153,10 +144,8 @@ bbox_response = bbox_ns.model(
     "BBoxAnnotationResponse",
     {
         "content_id": flask_restx.fields.String,
-        "bbox_file_path": flask_restx.fields.String,
         "submission_id": flask_restx.fields.String,
         "push_status": flask_restx.fields.String,
-        "push_message": flask_restx.fields.String,
     },
 )
 
@@ -166,7 +155,7 @@ class BBoxAnnotation(flask_restx.Resource):
     @bbox_ns.expect(bbox_request, validate=False)
     @bbox_ns.marshal_with(bbox_response, code=http.HTTPStatus.ACCEPTED)
     def post(self):
-        """Store one bounding-box annotation and push to DANDI."""
+        """Queue one bounding-box annotation for the next hourly DANDI upload."""
         body = flask.request.get_json(silent=True)
         if not isinstance(body, dict):
             raise BadRequest("Request body must be a JSON object")
@@ -176,21 +165,17 @@ class BBoxAnnotation(flask_restx.Resource):
         if dandi_path is None:
             raise BadRequest(f"Unknown content_id: {content_id}")
 
-        frame_index = int(body["frame_index"])
         submission_id = uuid.uuid4().hex
         body["submission_id"] = submission_id
 
-        bbox_file_path = BBOX_DANDISET_ROOT / "derivatives" / "incoming" / f"id-{submission_id}.json"
-        bbox_file_path.parent.mkdir(parents=True, exist_ok=True)
-        bbox_file_path.write_text(json.dumps(body, indent=2, sort_keys=True))
-
-        rc, stdout, stderr = dandi_upload(file_path=bbox_file_path, dandiset_root=BBOX_DANDISET_ROOT)
+        buffer_dir = BBOX_DANDISET_ROOT / "derivatives" / "buffer"
+        append_to_hourly_jsonl(body, buffer_dir)
+        logger.info("Queued bbox annotation submission_id=%s content_id=%s", submission_id, content_id)
 
         return {
             "content_id": content_id,
-            "bbox_file_path": str(bbox_file_path),
             "submission_id": submission_id,
-            "push_status": "succeeded" if rc == 0 else "failed",
+            "push_status": "queued",
         }, http.HTTPStatus.ACCEPTED
 
 
@@ -199,16 +184,46 @@ class BBoxAnnotation(flask_restx.Resource):
 # =============================================================================
 
 
-labels_ns = flask_restx.Namespace("annotations-labels", description="SLEAP .slp labels uploads")
+labels_ns = flask_restx.Namespace("annotations-labels", description="Keypoint label annotations")
+
+keypoint_model = labels_ns.model(
+    "Keypoint",
+    {
+        "id": flask_restx.fields.String(required=True, description="Machine identifier, e.g. 'left_front_paw'"),
+        "name": flask_restx.fields.String(required=True, description="Human-readable label name"),
+        "placed": flask_restx.fields.Boolean(required=True, description="Whether the keypoint was placed by the user"),
+        "pixel_x": flask_restx.fields.Float(required=True, description="X coordinate in pixels"),
+        "pixel_y": flask_restx.fields.Float(required=True, description="Y coordinate in pixels"),
+    },
+)
 
 labels_request = labels_ns.model(
     "LabelsAnnotation",
     {
         "video_url": flask_restx.fields.String(required=True),
-        "labels_file_content": flask_restx.fields.String(
-            required=True,
-            description="Base64-encoded bytes of the .slp file produced by SLEAP",
-        ),
+        "frame_index": flask_restx.fields.Integer(required=True, min=0),
+        "total_frames": flask_restx.fields.Integer(required=True, min=1),
+        "fps": flask_restx.fields.Float(required=True, min=0),
+        "frame_width": flask_restx.fields.Integer(required=True, min=1),
+        "frame_height": flask_restx.fields.Integer(required=True, min=1),
+        "timestamp": flask_restx.fields.String(required=True),
+        "labels": flask_restx.fields.List(flask_restx.fields.Nested(keypoint_model), required=True),
+    },
+)
+
+labels_record = labels_ns.model(
+    "LabelsRecord",
+    {
+        "submission_id": flask_restx.fields.String(description="UUID hex identifying this submission"),
+        "content_id": flask_restx.fields.String(description="Asset identifier extracted from video_url"),
+        "video_url": flask_restx.fields.String,
+        "frame_index": flask_restx.fields.Integer,
+        "total_frames": flask_restx.fields.Integer,
+        "fps": flask_restx.fields.Float,
+        "frame_width": flask_restx.fields.Integer,
+        "frame_height": flask_restx.fields.Integer,
+        "timestamp": flask_restx.fields.String,
+        "labels": flask_restx.fields.List(flask_restx.fields.Nested(keypoint_model)),
     },
 )
 
@@ -216,10 +231,8 @@ labels_response = labels_ns.model(
     "LabelsAnnotationResponse",
     {
         "content_id": flask_restx.fields.String,
-        "labels_file_content": flask_restx.fields.String,
         "submission_id": flask_restx.fields.String,
         "push_status": flask_restx.fields.String,
-        "push_message": flask_restx.fields.String,
     },
 )
 
@@ -229,35 +242,30 @@ class LabelsAnnotation(flask_restx.Resource):
     @labels_ns.expect(labels_request, validate=False)
     @labels_ns.marshal_with(labels_response, code=http.HTTPStatus.ACCEPTED)
     def post(self):
-        """Store a SLEAP .slp file and push to DANDI."""
+        """Queue a keypoint label annotation for the next hourly DANDI upload."""
         body = flask.request.get_json(silent=True)
         if not isinstance(body, dict):
             raise BadRequest("Request body must be a JSON object")
 
         video_url = body["video_url"]
-
         content_id = video_url.rsplit("/", maxsplit=1)[-1]
         if content_id not in CONTENT_ID_TO_DANDI_PATH:
             raise BadRequest(f"Unknown content_id: {content_id}")
 
-        try:
-            labels_file_bytes = base64.b64decode(body["labels_file_content"], validate=True)
-        except (binascii.Error, TypeError) as exc:
-            raise BadRequest("labels_file_content must be valid base64-encoded bytes") from exc
+        if not isinstance(body.get("labels"), list):
+            raise BadRequest("'labels' must be a list of keypoint objects")
 
         submission_id = uuid.uuid4().hex
-        labels_file_path = LABELS_DANDISET_ROOT / "derivatives" / "incoming" / f"id-{submission_id}.slp"
-        labels_file_path.parent.mkdir(parents=True, exist_ok=True)
-        labels_file_path.write_bytes(labels_file_bytes)
-        logger.info("Wrote labels SLP (%d bytes) -> %s", len(labels_file_bytes), labels_file_path)
+        record: dict = {"submission_id": submission_id, "content_id": content_id, **body}
 
-        rc, stdout, stderr = dandi_upload(file_path=labels_file_path, dandiset_root=LABELS_DANDISET_ROOT)
+        buffer_dir = LABELS_DANDISET_ROOT / "derivatives" / "buffer"
+        append_to_hourly_jsonl(record, buffer_dir)
+        logger.info("Queued labels submission_id=%s content_id=%s", submission_id, content_id)
 
         return {
             "content_id": content_id,
-            "labels_file_content": body["labels_file_content"],
             "submission_id": submission_id,
-            "push_status": "succeeded" if rc == 0 else "failed",
+            "push_status": "queued",
         }, http.HTTPStatus.ACCEPTED
 
 
@@ -273,13 +281,13 @@ health_ns = flask_restx.Namespace("health", description="Liveness")
 class Health(flask_restx.Resource):
     def get(self):
         checks = {
-            "token_present": bool(EMBER_DANDI_API_TOKEN),
+            "token_present": bool(EMBER_DANDI_API_KEY),
             "dandiset_root_exists": BBOX_DANDISET_ROOT.exists(),
             "dandiset_yaml_exists": (BBOX_DANDISET_ROOT / "dandiset.yaml").exists(),
             "dandi_bin_exists": pathlib.Path(DANDI_BIN).exists(),
         }
         ok = all(checks.values())
-        return {"status": "ok"}, http.HTTPStatus.OK
+        return {"status": "ok" if ok else "degraded", "checks": checks}, http.HTTPStatus.OK
 
 
 # =============================================================================
@@ -296,7 +304,7 @@ def create_app() -> flask.Flask:
     flask_app = flask.Flask(__name__)
     flask_cors.CORS(
         flask_app,
-        resources={r"/api/*": {"origins": ["https://codycbakerphd.github.io"]}},
+        resources={r"/api/.*": {"origins": ["https://codycbakerphd.github.io"]}},
         methods=["GET", "POST", "OPTIONS"],
         allow_headers=["Content-Type"],
     )
@@ -306,7 +314,7 @@ def create_app() -> flask.Flask:
         title="DANDI Annotation Ingest",
         description=(
             "Accepts per-frame bounding-box annotations and SLEAP .slp label files, "
-            "organizes them inside a local dandiset clone, and uploads to DANDI."
+            "queues them in hourly JSONL buffers, and uploads to DANDI via a scheduled CRON job."
         ),
         doc="/api/v1/docs",
         prefix="/api/v1",
