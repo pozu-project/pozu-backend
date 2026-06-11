@@ -330,40 +330,7 @@ def create_app() -> flask.Flask:
 
     @flask_app.route("/")
     def _index():
-        return (
-            """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>DANDI Annotation Ingest</title>
-  <style>
-    body { font-family: system-ui, sans-serif; max-width: 720px;
-           margin: 4em auto; padding: 0 1em; line-height: 1.5; color: #222; }
-    h1 { margin-bottom: 0.2em; }
-    .sub { color: #666; margin-top: 0; }
-    code { background: #f4f4f4; padding: 0.1em 0.35em; border-radius: 3px; }
-    ul { padding-left: 1.2em; }
-    a { color: #0b66c2; text-decoration: none; }
-    a:hover { text-decoration: underline; }
-  </style>
-</head>
-<body>
-  <h1>DANDI Annotation Ingest</h1>
-  <p class="sub">Flask + Flask-RESTX service for ingesting frame annotations
-  into a local dandiset and pushing to the DANDI archive.</p>
-
-  <h2>Endpoints</h2>
-  <ul>
-    <li><a href="/api/v1/docs">Swagger UI</a> &mdash; interactive API docs</li>
-    <li><code>POST /api/v1/annotations/bbox</code> &mdash; JSON bbox annotation</li>
-    <li><code>POST /api/v1/annotations/labels</code> &mdash; SLEAP <code>.slp</code> upload</li>
-    <li><a href="/api/v1/health">GET /api/v1/health</a> &mdash; liveness</li>
-  </ul>
-</body>
-</html>""",
-            200,
-            {"Content-Type": "text/html; charset=utf-8"},
-        )
+        return flask.redirect("/api/v1/docs", code=301)
 
     return flask_app
 
