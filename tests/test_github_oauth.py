@@ -61,10 +61,23 @@ def test_login_returns_400_when_client_id_unconfigured(client, monkeypatch, clie
 
 
 @pytest.mark.ai_generated
-def test_placeholder_constant_matches_deployed_default():
-    # The historical deployment's hard-coded fallback. If this drifts, the import-
-    # time normalisation and the route guard would stop catching the real default.
+@pytest.mark.parametrize("client_secret", ["", pozu_flask_app.PLACEHOLDER_CLIENT_SECRET])
+def test_login_returns_400_when_client_secret_unconfigured(client, monkeypatch, client_secret):
+    # A present client id but a missing/placeholder secret must also refuse at the
+    # front door, rather than redirecting and then failing the token exchange.
+    monkeypatch.setattr(pozu_flask_app, "GITHUB_CLIENT_SECRET", client_secret)
+
+    response = client.get("/auth/github/login")
+
+    assert response.status_code == http.HTTPStatus.BAD_REQUEST
+
+
+@pytest.mark.ai_generated
+def test_placeholder_constants_match_deployed_defaults():
+    # The historical deployment's hard-coded fallbacks. If these drift, the import-
+    # time normalisation and the route guard would stop catching the real defaults.
     assert pozu_flask_app.PLACEHOLDER_CLIENT_ID == "<client id>"
+    assert pozu_flask_app.PLACEHOLDER_CLIENT_SECRET == "<client secret>"
 
 
 @pytest.mark.ai_generated

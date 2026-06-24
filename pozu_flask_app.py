@@ -64,10 +64,12 @@ GITHUB_OAUTH_CALLBACK_URL = os.environ.get(
     "https://pozu-codycbakerphd.pythonanywhere.com/auth/github/callback",
 )
 
-# A historical deployment hard-coded this literal string as the client-id default.
-# Treat it as "unconfigured" so a stale value cannot leak into the GitHub redirect
-# and 404 there; the startup check below also warns loudly if it is ever seen.
+# A historical deployment hard-coded these literal strings as the credential
+# defaults. Treat them as "unconfigured" so a stale value cannot leak into the
+# GitHub handshake (the client id into the redirect, the secret into the token
+# exchange); the startup check below also warns loudly if either is ever seen.
 PLACEHOLDER_CLIENT_ID = "<client id>"
+PLACEHOLDER_CLIENT_SECRET = "<client secret>"  # noqa: S105
 
 GITHUB_CLIENT_ID = load_secret(env_var="GITHUB_CLIENT_ID", file_path="/home/CodyCBakerPhD/github_oauth_client_id")
 if GITHUB_CLIENT_ID == PLACEHOLDER_CLIENT_ID:
@@ -75,6 +77,8 @@ if GITHUB_CLIENT_ID == PLACEHOLDER_CLIENT_ID:
 GITHUB_CLIENT_SECRET = load_secret(
     env_var="GITHUB_CLIENT_SECRET", file_path="/home/CodyCBakerPhD/github_oauth_client_secret"
 )
+if GITHUB_CLIENT_SECRET == PLACEHOLDER_CLIENT_SECRET:
+    GITHUB_CLIENT_SECRET = ""
 
 # Signs both the short-lived OAuth `state` (Flask session cookie) and the app JWT.
 APP_SECRET_KEY = load_secret(env_var="APP_SECRET_KEY", file_path="/home/CodyCBakerPhD/app_secret_key")
@@ -466,7 +470,12 @@ def register_github_oauth_routes(flask_app: flask.Flask, /) -> None:
     @flask_app.route("/auth/github/login")
     def github_login():
         """Kick off the OAuth handshake by redirecting the browser to GitHub."""
-        if not GITHUB_CLIENT_ID or GITHUB_CLIENT_ID == PLACEHOLDER_CLIENT_ID:
+        if (
+            not GITHUB_CLIENT_ID
+            or GITHUB_CLIENT_ID == PLACEHOLDER_CLIENT_ID
+            or not GITHUB_CLIENT_SECRET
+            or GITHUB_CLIENT_SECRET == PLACEHOLDER_CLIENT_SECRET
+        ):
             raise BadRequest("GitHub OAuth is not configured on this server")
 
         state = secrets.token_urlsafe(32)
