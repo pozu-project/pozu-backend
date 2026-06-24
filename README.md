@@ -51,4 +51,8 @@ Secrets are read from an environment variable first, then from a chmod-600 file,
 /home/CodyCBakerPhD/app_secret_key
 ```
 
-`app_secret_key` signs both the OAuth `state` cookie and the JWT. Generate at least 32 random bytes for it, for example with `python -c "import secrets; print(secrets.token_urlsafe(48))"`. After creating or changing any of these files, reload the web app from the PythonAnywhere dashboard.
+`app_secret_key` signs both the OAuth `state` cookie and the JWT. Generate at least 32 random bytes for it, for example with `python -c "import secrets; print(secrets.token_urlsafe(48))"`. After creating or changing any of these files, reload the web app from the PythonAnywhere **Web** tab.
+
+> **PythonAnywhere env vars.** Variables exported in a Bash console or written to a `.env` file are **not** visible to the web worker on their own. Either use the chmod-600 secret files above (the worker reads them directly), or have the WSGI file load them — `pozu-codycbakerphd_pythonanywhere_com_wsgi.py` reads `/home/CodyCBakerPhD/.env` before importing the app. Either way the env var/file change only takes effect after a **Reload** from the Web tab; PythonAnywhere does not hot-reload them.
+
+At startup the app logs whether the GitHub OAuth client id and signing secrets are present (it never logs the values). If the client id or client secret is missing or still a literal placeholder (`<client id>` / `<client secret>`), it logs a warning and `GET /auth/github/login` returns a `400` instead of starting the handshake — so a misconfiguration fails loudly in the server log rather than 404-ing at GitHub (bad `client_id`) or failing the token exchange (bad `client_secret`).
