@@ -64,7 +64,14 @@ GITHUB_OAUTH_CALLBACK_URL = os.environ.get(
     "https://pozu-codycbakerphd.pythonanywhere.com/auth/github/callback",
 )
 
+# A historical deployment hard-coded this literal string as the client-id default.
+# Treat it as "unconfigured" so a stale value cannot leak into the GitHub redirect
+# and 404 there; the startup check below also warns loudly if it is ever seen.
+PLACEHOLDER_CLIENT_ID = "<client id>"
+
 GITHUB_CLIENT_ID = load_secret(env_var="GITHUB_CLIENT_ID", file_path="/home/CodyCBakerPhD/github_oauth_client_id")
+if GITHUB_CLIENT_ID == PLACEHOLDER_CLIENT_ID:
+    GITHUB_CLIENT_ID = ""
 GITHUB_CLIENT_SECRET = load_secret(
     env_var="GITHUB_CLIENT_SECRET", file_path="/home/CodyCBakerPhD/github_oauth_client_secret"
 )
@@ -132,6 +139,41 @@ class RedactFilter(logging.Filter):
 
 
 _handler.addFilter(RedactFilter([EMBER_DANDI_API_KEY, GITHUB_CLIENT_SECRET, APP_SECRET_KEY]))
+
+
+def _validate_oauth_config() -> None:
+    """Warn loudly at startup when the GitHub OAuth credentials are missing.
+
+    On PythonAnywhere, env vars set in a Bash console or the Web tab are not
+    visible to the web worker unless the WSGI file loads them; the worker then
+    silently falls back to an empty client id and 404s at GitHub. Surface that
+    here instead of failing only at request time. ``PLACEHOLDER_CLIENT_ID`` is
+    normalised to an empty string above, so an empty value covers both cases.
+
+    Only the *presence* of each secret is logged, never its value.
+    """
+    if not GITHUB_CLIENT_ID:
+        logger.warning(
+            "GitHub OAuth is NOT configured: client id is empty (or the placeholder %r). "
+            "The /auth/github/login route will reject requests with a 400 until a real "
+            "client id is supplied via the GITHUB_CLIENT_ID env var (loaded by the WSGI "
+            "file) or the /home/CodyCBakerPhD/github_oauth_client_id file, after which the "
+            "web app must be reloaded from the PythonAnywhere Web tab.",
+            PLACEHOLDER_CLIENT_ID,
+        )
+        return
+    missing = [
+        name
+        for name, value in (("GITHUB_CLIENT_SECRET", GITHUB_CLIENT_SECRET), ("APP_SECRET_KEY", APP_SECRET_KEY))
+        if not value
+    ]
+    if missing:
+        logger.warning("GitHub OAuth client id present, but these secrets are missing: %s", ", ".join(missing))
+    else:
+        logger.info("GitHub OAuth configured: client id and all signing secrets are present.")
+
+
+_validate_oauth_config()
 
 
 # =============================================================================
@@ -424,7 +466,7 @@ def register_github_oauth_routes(flask_app: flask.Flask, /) -> None:
     @flask_app.route("/auth/github/login")
     def github_login():
         """Kick off the OAuth handshake by redirecting the browser to GitHub."""
-        if not GITHUB_CLIENT_ID:
+        if not GITHUB_CLIENT_ID or GITHUB_CLIENT_ID == PLACEHOLDER_CLIENT_ID:
             raise BadRequest("GitHub OAuth is not configured on this server")
 
         state = secrets.token_urlsafe(32)

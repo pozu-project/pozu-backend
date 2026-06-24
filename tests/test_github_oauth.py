@@ -49,12 +49,22 @@ def test_login_redirects_to_github_with_expected_params(client):
 
 
 @pytest.mark.ai_generated
-def test_login_returns_400_when_client_id_missing(client, monkeypatch):
-    monkeypatch.setattr(pozu_flask_app, "GITHUB_CLIENT_ID", "")
+@pytest.mark.parametrize("client_id", ["", pozu_flask_app.PLACEHOLDER_CLIENT_ID])
+def test_login_returns_400_when_client_id_unconfigured(client, monkeypatch, client_id):
+    # Both an empty client id and the historical "<client id>" placeholder must be
+    # rejected with a clean 400 rather than redirected to GitHub (which 404s there).
+    monkeypatch.setattr(pozu_flask_app, "GITHUB_CLIENT_ID", client_id)
 
     response = client.get("/auth/github/login")
 
     assert response.status_code == http.HTTPStatus.BAD_REQUEST
+
+
+@pytest.mark.ai_generated
+def test_placeholder_constant_matches_deployed_default():
+    # The historical deployment's hard-coded fallback. If this drifts, the import-
+    # time normalisation and the route guard would stop catching the real default.
+    assert pozu_flask_app.PLACEHOLDER_CLIENT_ID == "<client id>"
 
 
 @pytest.mark.ai_generated
