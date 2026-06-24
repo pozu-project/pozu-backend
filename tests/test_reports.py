@@ -80,8 +80,8 @@ def test_accepts_valid_report(client, captured):
     assert record["content_id"] == CONTENT_ID
     assert record["reason"] == "inappropriate_content"
     assert record["submitted_by"] == "octocat"
-    # Reports buffer outside any dandiset so cron never uploads them to DANDI.
-    assert buffer_dir == pozu_flask_app.REPORTS_ROOT / "buffer"
+    # Reports buffer inside their reserved dandiset for the hourly DANDI upload.
+    assert buffer_dir == pozu_flask_app.REPORTS_DANDISET_ROOT / "derivatives" / "buffer"
 
 
 @pytest.mark.ai_generated
