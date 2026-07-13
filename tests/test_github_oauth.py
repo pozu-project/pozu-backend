@@ -15,11 +15,12 @@ APP_SECRET = "test-app-secret-at-least-32-bytes-long"
 
 
 @pytest.fixture
-def client(monkeypatch):
-    """A Flask test client with deterministic OAuth credentials patched in."""
+def client(monkeypatch, tmp_path):
+    """A Flask test client with deterministic OAuth credentials and an isolated DB."""
     monkeypatch.setattr(pozu_flask_app, "GITHUB_CLIENT_ID", CLIENT_ID)
     monkeypatch.setattr(pozu_flask_app, "GITHUB_CLIENT_SECRET", CLIENT_SECRET)
     monkeypatch.setattr(pozu_flask_app, "APP_SECRET_KEY", APP_SECRET)
+    monkeypatch.setattr(pozu_flask_app, "POZU_DB_PATH", str(tmp_path / "pozu_app.db"))
     flask_app = pozu_flask_app.create_app()
     flask_app.config.update(TESTING=True)
     return flask_app.test_client()

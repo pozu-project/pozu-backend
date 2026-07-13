@@ -44,7 +44,9 @@ def _body(**overrides):
 
 
 def _auth_headers():
-    token = pozu_flask_app.mint_app_token({"id": 4242, "login": "octocat", "name": "Mona"})
+    token = pozu_flask_app.mint_app_token(
+        github_user={"id": 4242, "login": "octocat", "name": "Mona"}, roles=[], permissions=[]
+    )
     return {"Authorization": f"Bearer {token}"}
 
 

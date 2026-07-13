@@ -9,6 +9,7 @@ Check `/api/v1/docs` for API reference.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import functools
 import json
@@ -16,6 +17,7 @@ import logging
 import os
 import pathlib
 import secrets
+import sqlite3
 import sys
 import urllib.parse
 import uuid
@@ -90,6 +92,24 @@ JWT_ALGORITHM = "HS256"
 JWT_ISSUER = "pozu-backend"
 JWT_TTL_SECONDS = 3600
 
+# -- Persistence & authorization ----------------------------------------------
+# Not a secret, so it follows the same env-var-with-fallback pattern as
+# GITHUB_OAUTH_CALLBACK_URL / FRONTEND_URL rather than load_secret().
+POZU_DB_PATH = os.environ.get("POZU_DB_PATH", "/home/CodyCBakerPhD/mysite/pozu_app.db")
+
+# Comma-separated GitHub logins that are granted the "admin" role on every login.
+# This is the only way to seed the first admin without direct DB access.
+POZU_ADMIN_LOGINS = load_secret(env_var="POZU_ADMIN_LOGINS", file_path="/home/CodyCBakerPhD/pozu_admin_logins")
+
+# Canonical permission and role definitions, seeded into the DB on schema init.
+# Add new permissions/roles here; seeding is idempotent so existing deployments
+# pick up additions on their next request.
+PERMISSIONS = ("users:read", "users:write", "roles:read", "roles:write")
+ROLE_DEFINITIONS = {
+    "admin": PERMISSIONS,
+    "labeler": (),
+}
+
 BBOX_DANDISET_ROOT = pathlib.Path("/home/CodyCBakerPhD/mysite/000469")
 LABELS_DANDISET_ROOT = pathlib.Path("/home/CodyCBakerPhD/mysite/000470")
 # "No subject present" is a legitimate annotation outcome (the frame genuinely
@@ -154,7 +174,7 @@ class RedactFilter(logging.Filter):
         return True
 
 
-_handler.addFilter(RedactFilter([EMBER_DANDI_API_KEY, GITHUB_CLIENT_SECRET, APP_SECRET_KEY]))
+_handler.addFilter(RedactFilter([EMBER_DANDI_API_KEY, GITHUB_CLIENT_SECRET, APP_SECRET_KEY, POZU_ADMIN_LOGINS]))
 
 
 def _validate_oauth_config() -> None:
@@ -257,6 +277,202 @@ def require_auth(handler, /):
         return handler(*args, **kwargs)
 
     return wrapper
+
+
+# =============================================================================
+# Persistence (SQLite) & role/permission resolution
+# =============================================================================
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+    github_id   INTEGER PRIMARY KEY,
+    login       TEXT NOT NULL,
+    name        TEXT,
+    avatar_url  TEXT,
+    first_seen  TEXT NOT NULL,
+    last_seen   TEXT NOT NULL,
+    login_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS roles (
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS permissions (
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS role_permissions (
+    role_id       INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+    permission_id INTEGER NOT NULL REFERENCES permissions(id) ON DELETE CASCADE,
+    PRIMARY KEY (role_id, permission_id)
+);
+CREATE TABLE IF NOT EXISTS user_roles (
+    github_id INTEGER NOT NULL REFERENCES users(github_id) ON DELETE CASCADE,
+    role_id   INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+    PRIMARY KEY (github_id, role_id)
+);
+"""
+
+
+def _seed_roles_and_permissions(connection, /) -> None:
+    """Idempotently seed ``PERMISSIONS`` and ``ROLE_DEFINITIONS`` into the DB."""
+    for permission_name in PERMISSIONS:
+        connection.execute("INSERT OR IGNORE INTO permissions (name) VALUES (?)", (permission_name,))
+    for role_name in ROLE_DEFINITIONS:
+        connection.execute("INSERT OR IGNORE INTO roles (name) VALUES (?)", (role_name,))
+
+    for role_name, permission_names in ROLE_DEFINITIONS.items():
+        role_id = connection.execute("SELECT id FROM roles WHERE name = ?", (role_name,)).fetchone()["id"]
+        for permission_name in permission_names:
+            permission_id = connection.execute(
+                "SELECT id FROM permissions WHERE name = ?", (permission_name,)
+            ).fetchone()["id"]
+            connection.execute(
+                "INSERT OR IGNORE INTO role_permissions (role_id, permission_id) VALUES (?, ?)",
+                (role_id, permission_id),
+            )
+
+
+@contextlib.contextmanager
+def db_connection():
+    """Open a short-lived SQLite connection, initializing/seeding the schema.
+
+    A fresh connection is opened per call rather than shared across
+    threads/workers, relying on SQLite's own locking for concurrency. Commits
+    on clean exit; any exception raised inside the ``with`` block propagates
+    without committing.
+    """
+    connection = sqlite3.connect(POZU_DB_PATH)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.executescript(SCHEMA_SQL)
+    _seed_roles_and_permissions(connection)
+    try:
+        yield connection
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def upsert_user(github_user, /) -> None:
+    """Insert or update the ``users`` row for a freshly authenticated GitHub profile.
+
+    Inserts with ``login_count=1`` on first sight; on conflict refreshes the
+    profile fields, bumps ``last_seen``, and increments ``login_count``.
+    """
+    now = datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
+    with db_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO users (github_id, login, name, avatar_url, first_seen, last_seen, login_count)
+            VALUES (:github_id, :login, :name, :avatar_url, :now, :now, 1)
+            ON CONFLICT(github_id) DO UPDATE SET
+                login = excluded.login,
+                name = excluded.name,
+                avatar_url = excluded.avatar_url,
+                last_seen = excluded.last_seen,
+                login_count = login_count + 1
+            """,
+            {
+                "github_id": github_user["id"],
+                "login": github_user.get("login") or "",
+                "name": github_user.get("name"),
+                "avatar_url": github_user.get("avatar_url"),
+                "now": now,
+            },
+        )
+
+
+def ensure_admin_bootstrap(*, github_id: int, login: str) -> None:
+    """Grant the "admin" role to *github_id* when *login* is on the allow-list.
+
+    Reads ``POZU_ADMIN_LOGINS`` on every call (rather than once at import time)
+    so an ops-side edit to the secret file takes effect on the next login
+    without a redeploy.
+    """
+    admin_logins = {name.strip() for name in POZU_ADMIN_LOGINS.split(",") if name.strip()}
+    if login not in admin_logins:
+        return
+    with db_connection() as connection:
+        role_row = connection.execute("SELECT id FROM roles WHERE name = ?", ("admin",)).fetchone()
+        if role_row is None:
+            return
+        connection.execute(
+            "INSERT OR IGNORE INTO user_roles (github_id, role_id) VALUES (?, ?)",
+            (github_id, role_row["id"]),
+        )
+
+
+def record_login(github_user, /) -> None:
+    """Persist a login (UPSERT + admin bootstrap); never raises.
+
+    DB unavailability must not block issuing the JWT, so any failure here is
+    logged (RedactFilter still applies) and swallowed.
+    """
+    try:
+        upsert_user(github_user)
+        ensure_admin_bootstrap(github_id=github_user["id"], login=github_user.get("login") or "")
+    except sqlite3.Error:
+        logger.exception("Failed to persist login for GitHub user id=%s", github_user.get("id"))
+
+
+def resolve_roles(github_id, /) -> list:
+    """Return the sorted role names held by *github_id*, read fresh from the DB."""
+    with db_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT roles.name AS name
+            FROM user_roles
+            JOIN roles ON roles.id = user_roles.role_id
+            WHERE user_roles.github_id = ?
+            ORDER BY roles.name
+            """,
+            (github_id,),
+        ).fetchall()
+    return [row["name"] for row in rows]
+
+
+def resolve_permissions(github_id, /) -> set:
+    """Return the union of permissions granted by *github_id*'s roles, read fresh from the DB.
+
+    This is the sole source of truth for authorization decisions; the JWT's
+    ``permissions`` claim is a UI hint only and must never be used here.
+    """
+    with db_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT DISTINCT permissions.name AS name
+            FROM user_roles
+            JOIN role_permissions ON role_permissions.role_id = user_roles.role_id
+            JOIN permissions ON permissions.id = role_permissions.permission_id
+            WHERE user_roles.github_id = ?
+            """,
+            (github_id,),
+        ).fetchall()
+    return {row["name"] for row in rows}
+
+
+def require_permission(permission_name, /):
+    """Decorator factory requiring a valid JWT AND a DB-resolved permission.
+
+    Enforces authentication the same way ``require_auth`` does, then
+    re-resolves permissions from the database for ``flask.g.user["sub"]`` on
+    every request. The JWT's own ``permissions`` claim is never consulted for
+    enforcement, since it can be stale by up to ``JWT_TTL_SECONDS``.
+    """
+
+    def decorator(handler, /):
+        @require_auth
+        @functools.wraps(handler)
+        def wrapper(*args, **kwargs):
+            github_id = int(flask.g.user["sub"])
+            if permission_name not in resolve_permissions(github_id):
+                raise Unauthorized(f"Missing required permission: {permission_name}")
+            return handler(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 # =============================================================================
@@ -600,6 +816,199 @@ class ReportedFrame(flask_restx.Resource):
 
 
 # =============================================================================
+# Admin namespace
+# =============================================================================
+
+
+admin_ns = flask_restx.Namespace("admin", description="User, role, and permission administration")
+
+ADMIN_USER_SORT_COLUMNS = {
+    "last_seen": "last_seen DESC",
+    "first_seen": "first_seen DESC",
+    "login_count": "login_count DESC",
+    "login": "login ASC",
+}
+ADMIN_USERS_DEFAULT_LIMIT = 50
+ADMIN_USERS_MAX_LIMIT = 200
+
+admin_user_model = admin_ns.model(
+    "AdminUser",
+    {
+        "github_id": flask_restx.fields.Integer,
+        "login": flask_restx.fields.String,
+        "name": flask_restx.fields.String,
+        "avatar_url": flask_restx.fields.String,
+        "first_seen": flask_restx.fields.String,
+        "last_seen": flask_restx.fields.String,
+        "login_count": flask_restx.fields.Integer,
+        "roles": flask_restx.fields.List(flask_restx.fields.String),
+    },
+)
+
+admin_users_response = admin_ns.model(
+    "AdminUsersResponse",
+    {
+        "total": flask_restx.fields.Integer,
+        "users": flask_restx.fields.List(flask_restx.fields.Nested(admin_user_model)),
+    },
+)
+
+admin_role_model = admin_ns.model(
+    "AdminRole",
+    {
+        "name": flask_restx.fields.String,
+        "permissions": flask_restx.fields.List(flask_restx.fields.String),
+    },
+)
+
+admin_roles_response = admin_ns.model(
+    "AdminRolesResponse",
+    {"roles": flask_restx.fields.List(flask_restx.fields.Nested(admin_role_model))},
+)
+
+admin_user_roles_request = admin_ns.model(
+    "AdminUserRolesRequest",
+    {"roles": flask_restx.fields.List(flask_restx.fields.String, required=True)},
+)
+
+admin_me_response = admin_ns.model(
+    "AdminMe",
+    {
+        "github_id": flask_restx.fields.Integer,
+        "login": flask_restx.fields.String,
+        "roles": flask_restx.fields.List(flask_restx.fields.String),
+        "permissions": flask_restx.fields.List(flask_restx.fields.String),
+    },
+)
+
+
+def _user_row_to_dict(user_row, /) -> dict:
+    """Project a ``users`` row plus its resolved roles into the API shape."""
+    return {**dict(user_row), "roles": resolve_roles(user_row["github_id"])}
+
+
+@admin_ns.route("/users")
+class AdminUsers(flask_restx.Resource):
+    @require_permission("users:read")
+    @admin_ns.marshal_with(admin_users_response)
+    def get(self):
+        """List users with pagination and sorting."""
+        try:
+            limit = int(flask.request.args.get("limit", ADMIN_USERS_DEFAULT_LIMIT))
+            offset = int(flask.request.args.get("offset", 0))
+        except ValueError:
+            raise BadRequest("'limit' and 'offset' must be integers") from None
+        limit = max(1, min(limit, ADMIN_USERS_MAX_LIMIT))
+        offset = max(0, offset)
+
+        sort = flask.request.args.get("sort", "last_seen")
+        if sort not in ADMIN_USER_SORT_COLUMNS:
+            raise BadRequest(f"Invalid sort: {sort!r}. Must be one of: {', '.join(ADMIN_USER_SORT_COLUMNS)}")
+
+        with db_connection() as connection:
+            total = connection.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+            rows = connection.execute(
+                f"SELECT * FROM users ORDER BY {ADMIN_USER_SORT_COLUMNS[sort]} LIMIT ? OFFSET ?",  # noqa: S608
+                (limit, offset),
+            ).fetchall()
+
+        return {"total": total, "users": [_user_row_to_dict(row) for row in rows]}
+
+
+@admin_ns.route("/roles")
+class AdminRoles(flask_restx.Resource):
+    @require_permission("roles:read")
+    @admin_ns.marshal_with(admin_roles_response)
+    def get(self):
+        """List roles and the permissions each one grants."""
+        with db_connection() as connection:
+            role_rows = connection.execute("SELECT id, name FROM roles ORDER BY name").fetchall()
+            roles = []
+            for role_row in role_rows:
+                permission_rows = connection.execute(
+                    """
+                    SELECT permissions.name AS name
+                    FROM role_permissions
+                    JOIN permissions ON permissions.id = role_permissions.permission_id
+                    WHERE role_permissions.role_id = ?
+                    ORDER BY permissions.name
+                    """,
+                    (role_row["id"],),
+                ).fetchall()
+                roles.append({"name": role_row["name"], "permissions": [row["name"] for row in permission_rows]})
+
+        return {"roles": roles}
+
+
+@admin_ns.route("/users/<int:github_id>/roles")
+class AdminUserRoles(flask_restx.Resource):
+    @require_permission("roles:write")
+    @admin_ns.expect(admin_user_roles_request, validate=False)
+    @admin_ns.marshal_with(admin_user_model)
+    def put(self, github_id):
+        """Replace a user's role set."""
+        body = flask.request.get_json(silent=True)
+        if not isinstance(body, dict) or not isinstance(body.get("roles"), list):
+            raise BadRequest("'roles' must be a list of role names")
+        role_names = body["roles"]
+
+        with db_connection() as connection:
+            user_row = connection.execute("SELECT github_id FROM users WHERE github_id = ?", (github_id,)).fetchone()
+            if user_row is None:
+                raise BadRequest(f"Unknown user: {github_id}")
+
+            role_rows = connection.execute("SELECT id, name FROM roles").fetchall()
+            name_to_id = {row["name"]: row["id"] for row in role_rows}
+            unknown_roles = set(role_names) - set(name_to_id)
+            if unknown_roles:
+                raise BadRequest(f"Unknown role(s): {', '.join(sorted(unknown_roles))}")
+
+            admin_role_id = name_to_id.get("admin")
+            if admin_role_id is not None:
+                is_currently_admin = (
+                    connection.execute(
+                        "SELECT 1 FROM user_roles WHERE role_id = ? AND github_id = ?", (admin_role_id, github_id)
+                    ).fetchone()
+                    is not None
+                )
+                other_admin_count = connection.execute(
+                    "SELECT COUNT(*) AS c FROM user_roles WHERE role_id = ? AND github_id != ?",
+                    (admin_role_id, github_id),
+                ).fetchone()["c"]
+                if is_currently_admin and "admin" not in role_names and other_admin_count == 0:
+                    raise BadRequest("cannot remove the last admin")
+
+            connection.execute("DELETE FROM user_roles WHERE github_id = ?", (github_id,))
+            for role_name in role_names:
+                connection.execute(
+                    "INSERT INTO user_roles (github_id, role_id) VALUES (?, ?)", (github_id, name_to_id[role_name])
+                )
+
+            updated_user_row = connection.execute("SELECT * FROM users WHERE github_id = ?", (github_id,)).fetchone()
+
+        return _user_row_to_dict(updated_user_row)
+
+
+@admin_ns.route("/me")
+class AdminMe(flask_restx.Resource):
+    @require_auth
+    @admin_ns.marshal_with(admin_me_response)
+    def get(self):
+        """Return the caller's own DB-resolved identity, roles, and permissions."""
+        github_id = int(flask.g.user["sub"])
+        with db_connection() as connection:
+            user_row = connection.execute("SELECT login FROM users WHERE github_id = ?", (github_id,)).fetchone()
+        login = user_row["login"] if user_row is not None else flask.g.user.get("login")
+
+        return {
+            "github_id": github_id,
+            "login": login,
+            "roles": resolve_roles(github_id),
+            "permissions": sorted(resolve_permissions(github_id)),
+        }
+
+
+# =============================================================================
 # Health namespace
 # =============================================================================
 
@@ -625,12 +1034,18 @@ class Health(flask_restx.Resource):
 # =============================================================================
 
 
-def mint_app_token(github_user: dict, /) -> str:
+def mint_app_token(*, github_user: dict, roles: list, permissions: list) -> str:
     """Mint a short-lived signed JWT identifying the authenticated GitHub user.
 
     The SPA is hosted cross-site from this backend, so rather than a third-party
     session cookie the token travels back to the frontend and is replayed as a
     ``Authorization: Bearer`` header on later API calls.
+
+    ``roles``/``permissions`` are a non-authoritative snapshot for the UI only
+    (e.g. to hide admin-only nav items). They can be stale for up to
+    ``JWT_TTL_SECONDS`` and MUST NOT be trusted for server-side authorization;
+    every protected request re-resolves permissions from the DB via
+    ``resolve_permissions()``/``require_permission()`` instead.
     """
     now = datetime.datetime.now(tz=datetime.timezone.utc)
     payload = {
@@ -639,6 +1054,8 @@ def mint_app_token(github_user: dict, /) -> str:
         "login": github_user.get("login"),
         "name": github_user.get("name"),
         "avatar_url": github_user.get("avatar_url"),
+        "roles": roles,
+        "permissions": permissions,
         "iat": now,
         "exp": now + datetime.timedelta(seconds=JWT_TTL_SECONDS),
     }
@@ -715,7 +1132,10 @@ def register_github_oauth_routes(flask_app: flask.Flask, /) -> None:
         user_response.raise_for_status()
         github_user = user_response.json()
 
-        app_token = mint_app_token(github_user)
+        record_login(github_user)
+        roles = resolve_roles(github_user["id"])
+        permissions = sorted(resolve_permissions(github_user["id"]))
+        app_token = mint_app_token(github_user=github_user, roles=roles, permissions=permissions)
         logger.info("Authenticated GitHub user login=%s id=%s", github_user.get("login"), github_user.get("id"))
 
         fragment = urllib.parse.urlencode({"token": app_token})
@@ -740,7 +1160,7 @@ def create_app() -> flask.Flask:
     flask_cors.CORS(
         flask_app,
         resources={r"/api/.*": {"origins": ["https://pozu-project.github.io"]}},
-        methods=["GET", "POST", "OPTIONS"],
+        methods=["GET", "POST", "PUT", "OPTIONS"],
         allow_headers=["Content-Type", "Authorization"],
     )
     api = flask_restx.Api(
@@ -760,6 +1180,7 @@ def create_app() -> flask.Flask:
     api.add_namespace(labels_ns, path="/annotations/labels")
     api.add_namespace(no_subject_ns, path="/annotations/no-subject")
     api.add_namespace(reports_ns, path="/reports")
+    api.add_namespace(admin_ns, path="/admin")
     api.add_namespace(health_ns, path="/health")
 
     @api.errorhandler(BadRequest)

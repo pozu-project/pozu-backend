@@ -54,7 +54,9 @@ def _annotation_body():
 
 def _valid_token():
     """Mint a valid, unexpired app token for a fake GitHub user."""
-    return pozu_flask_app.mint_app_token({"id": 4242, "login": "octocat", "name": "Mona"})
+    return pozu_flask_app.mint_app_token(
+        github_user={"id": 4242, "login": "octocat", "name": "Mona"}, roles=[], permissions=[]
+    )
 
 
 def _expired_token():
