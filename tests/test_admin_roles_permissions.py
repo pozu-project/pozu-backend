@@ -277,6 +277,24 @@ def test_upsert_insert_vs_update(app_env, login_times):
     assert listing["total"] == 1
 
 
+@pytest.mark.ai_generated
+@pytest.mark.parametrize(
+    "profile",
+    [
+        pytest.param({"id": 77, "login": None, "name": "Anon"}, id="login-none"),
+        pytest.param({"id": 77, "name": "Anon"}, id="login-missing"),
+    ],
+)
+def test_upsert_tolerates_missing_login(app_env, profile):
+    # users.login is NOT NULL, so a profile without a login must coerce to ""
+    # rather than raise an IntegrityError.
+    pozu_flask_app.upsert_user(profile)
+
+    record = pozu_flask_app.get_user(77)
+    assert record["login"] == ""
+    assert record["login_count"] == 1
+
+
 # -----------------------------------------------------------------------------
 # GET /admin/roles
 # -----------------------------------------------------------------------------

@@ -183,7 +183,7 @@ class RedactFilter(logging.Filter):
         return True
 
 
-_handler.addFilter(RedactFilter([EMBER_DANDI_API_KEY, GITHUB_CLIENT_SECRET, APP_SECRET_KEY]))
+_handler.addFilter(RedactFilter([EMBER_DANDI_API_KEY, GITHUB_CLIENT_SECRET, APP_SECRET_KEY, POZU_ADMIN_LOGINS]))
 
 
 def _validate_oauth_config() -> None:
@@ -354,7 +354,8 @@ def upsert_user(github_user, /) -> None:
             """,
             (
                 int(github_user["id"]),
-                github_user.get("login"),
+                # users.login is NOT NULL; coerce a missing/None login to "".
+                github_user.get("login") or "",
                 github_user.get("name"),
                 github_user.get("avatar_url"),
                 now,
