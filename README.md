@@ -49,9 +49,18 @@ Secrets are read from an environment variable first, then from a chmod-600 file,
 /home/CodyCBakerPhD/github_oauth_client_id
 /home/CodyCBakerPhD/github_oauth_client_secret
 /home/CodyCBakerPhD/app_secret_key
+/home/CodyCBakerPhD/pozu_admin_logins
 ```
 
 `app_secret_key` signs both the OAuth `state` cookie and the JWT. Generate at least 32 random bytes for it, for example with `python -c "import secrets; print(secrets.token_urlsafe(48))"`. After creating or changing any of these files, reload the web app from the PythonAnywhere **Web** tab.
+
+`pozu_admin_logins` (or the `POZU_ADMIN_LOGINS` env var) is a comma-separated allow-list of GitHub logins. Any user on the list is granted the `admin` role every time they sign in. This bootstraps the first admin without touching the database directly. Once at least one admin exists, further role grants can go through the admin API instead.
+
+### User store and roles
+
+Signed-in users are persisted to a local SQLite database. The path comes from the `POZU_DB_PATH` env var (or the `/home/CodyCBakerPhD/pozu_db_path` file) and defaults to `/home/CodyCBakerPhD/mysite/pozu_app.db`. The schema is created and seeded automatically on first use.
+
+Authorization is role-based. Roles ("admin", "labeler") grant permissions (`users:read`, `users:write`, `roles:read`, `roles:write`), and permissions are always resolved from the database on each protected request. The JWT carries a `roles`/`permissions` snapshot for frontend UI hints only, and it is never trusted for server-side authorization. The admin API lives under `/api/v1/admin` (list users, list roles, replace a user's roles, and a `/me` endpoint returning the caller's authoritative roles and permissions).
 
 > **PythonAnywhere env vars.** Variables exported in a Bash console or written to a `.env` file are **not** visible to the web worker on their own. Either use the chmod-600 secret files above (the worker reads them directly), or have the WSGI file load them — `pozu-codycbakerphd_pythonanywhere_com_wsgi.py` reads `/home/CodyCBakerPhD/.env` before importing the app. Either way the env var/file change only takes effect after a **Reload** from the Web tab; PythonAnywhere does not hot-reload them.
 
