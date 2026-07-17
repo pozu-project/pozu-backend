@@ -14,10 +14,6 @@ import pozu_flask_app
 
 APP_SECRET = "test-app-secret-at-least-32-bytes-long"
 
-# Any key in CONTENT_ID_TO_DANDI_PATH works; its last path segment is the content_id.
-CONTENT_ID = next(iter(pozu_flask_app.CONTENT_ID_TO_DANDI_PATH))
-VIDEO_URL = f"https://example.org/videos/{CONTENT_ID}"
-
 ENDPOINT = "/api/v1/clips"
 ALLOWED_ORIGIN = "https://pozu-project.github.io"
 
@@ -57,7 +53,6 @@ def client(captured):
 def _clip_body(**overrides):
     """A minimally valid VideoClip payload."""
     body = {
-        "video_url": VIDEO_URL,
         "mp4": _b64(FAKE_MP4),
         "timestamp": "2026-07-17T00:00:00Z",
     }
@@ -114,7 +109,6 @@ def test_accepts_and_uploads_valid_clip(client, captured, mp4_value):
     assert response.status_code == http.HTTPStatus.CREATED
     payload = response.get_json()
     assert payload["push_status"] == "uploaded"
-    assert payload["content_id"] == CONTENT_ID
     assert payload["clip_file"].endswith(".mp4")
     assert payload["clip_size_bytes"] == len(FAKE_MP4)
     assert payload["submission_id"]
@@ -122,9 +116,7 @@ def test_accepts_and_uploads_valid_clip(client, captured, mp4_value):
     assert len(written) == 1
     assert written[0]["mp4_blob"] == FAKE_MP4
     record = written[0]["record"]
-    assert record["content_id"] == CONTENT_ID
     assert record["submitted_by"] == "octocat"
-    assert record["video_url"] == VIDEO_URL
     assert record["clip_file"] == payload["clip_file"]
     assert record["clip_size_bytes"] == len(FAKE_MP4)
 
@@ -141,12 +133,6 @@ def test_accepts_and_uploads_valid_clip(client, captured, mp4_value):
         pytest.param({"mp4": 12345}, "base64-encoded string", id="mp4-not-a-string"),
         pytest.param({"mp4": "!!! not base64 !!!"}, "base64", id="mp4-invalid-base64"),
         pytest.param({"mp4": _b64(b"\x00" * 32)}, "ftyp", id="mp4-missing-ftyp"),
-        pytest.param({"video_url": None}, "video_url", id="missing-video-url"),
-        pytest.param(
-            {"video_url": "https://example.org/videos/not-a-real-id"},
-            "content_id",
-            id="unknown-content-id",
-        ),
     ],
 )
 def test_invalid_payloads_are_rejected(client, captured, overrides, message_snippet):
@@ -280,7 +266,7 @@ def _real_mp4_bytes(tmp_path, /):
 def test_write_clip_files_accepts_real_video(tmp_path, monkeypatch):
     monkeypatch.setattr(pozu_flask_app, "CLIPS_DANDISET_ROOT", tmp_path / "000474")
     mp4_blob = _real_mp4_bytes(tmp_path)
-    record = {"submission_id": "abc123", "content_id": CONTENT_ID}
+    record = {"submission_id": "abc123", "submitted_by": "anonymous"}
 
     clip_path, sidecar_path = pozu_flask_app.write_clip_files(
         mp4_blob=mp4_blob, record=record, clip_filename="real-clip.mp4"

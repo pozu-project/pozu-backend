@@ -33,7 +33,7 @@ from a bash console.
 
 ### Video clips
 
-`POST /api/v1/clips` accepts a small, fully-encoded MP4 file as base64 (bare base64 or a `data:video/mp4;base64,` URL) in the `mp4` field, alongside the usual `video_url`. The server verifies the bytes with `ffprobe` (they must contain a decodable video stream), writes the clip plus a JSON provenance sidecar into dandiset `000474`, and runs `dandi upload` synchronously inside the request. There is no buffer and no cron involvement for clips.
+`POST /api/v1/clips` accepts a small, fully-encoded MP4 file as base64 (bare base64 or a `data:video/mp4;base64,` URL) in the `mp4` field, plus an optional `timestamp`. There is no source `video_url` in this design. The server verifies the bytes with `ffprobe` (they must contain a decodable video stream), writes the clip plus a JSON provenance sidecar into dandiset `000474`, and runs `dandi upload` synchronously inside the request. There is no buffer and no cron involvement for clips.
 
 Unlike the annotation routes, no sign-in is required for clips at this time. The DANDI upload authenticates with the server-stored API key, and the provenance sidecar records the submitter as `anonymous` unless the request happens to carry a valid `Authorization: Bearer` token.
 

@@ -784,7 +784,6 @@ clips_ns = flask_restx.Namespace(
 clip_request = clips_ns.model(
     "VideoClip",
     {
-        "video_url": flask_restx.fields.String(required=True),
         "mp4": flask_restx.fields.String(
             required=True,
             description=(
@@ -800,7 +799,6 @@ clip_request = clips_ns.model(
 clip_response = clips_ns.model(
     "VideoClipResponse",
     {
-        "content_id": flask_restx.fields.String,
         "submission_id": flask_restx.fields.String,
         "clip_file": flask_restx.fields.String,
         "clip_size_bytes": flask_restx.fields.Integer,
@@ -824,13 +822,6 @@ class VideoClip(flask_restx.Resource):
         if not isinstance(body, dict):
             raise BadRequest("Request body must be a JSON object")
 
-        video_url = body.get("video_url")
-        if not isinstance(video_url, str) or not video_url:
-            raise BadRequest("'video_url' is required")
-        content_id = video_url.rsplit("/", maxsplit=1)[-1]
-        if content_id not in CONTENT_ID_TO_DANDI_PATH:
-            raise BadRequest(f"Unknown content_id: {content_id}")
-
         mp4_blob = decode_clip_mp4(body.get("mp4"))
 
         submission_id = uuid.uuid4().hex
@@ -840,19 +831,16 @@ class VideoClip(flask_restx.Resource):
 
         record: dict = {
             "submission_id": submission_id,
-            "content_id": content_id,
             "submitted_by": submitted_by,
-            "video_url": video_url,
             "clip_file": clip_filename,
             "clip_size_bytes": len(mp4_blob),
             "timestamp": body.get("timestamp"),
         }
         clip_paths = write_clip_files(mp4_blob=mp4_blob, record=record, clip_filename=clip_filename)
         upload_clip_to_dandi(clip_paths)
-        logger.info("Clip submission_id=%s content_id=%s file=%s uploaded", submission_id, content_id, clip_filename)
+        logger.info("Clip submission_id=%s file=%s uploaded", submission_id, clip_filename)
 
         return {
-            "content_id": content_id,
             "submission_id": submission_id,
             "clip_file": clip_filename,
             "clip_size_bytes": len(mp4_blob),
