@@ -40,7 +40,6 @@ import requests
 
 VENV_BIN = "/home/CodyCBakerPhD/.virtualenvs/pozu/bin"
 DANDI_BIN = f"{VENV_BIN}/dandi"
-VENV_PYTHON = f"{VENV_BIN}/python"
 
 
 def load_secret(*, env_var: str, file_path: str) -> str:
@@ -757,16 +756,13 @@ def upload_clip_to_dandi(clip_paths, /) -> None:
     env = os.environ.copy()
     env["EMBER_DANDI_API_KEY"] = EMBER_DANDI_API_KEY
     env["PATH"] = f"{VENV_BIN}:{env.get('PATH', '')}"
-    # dandi-cli's `upload` command only discovers recognized asset types
-    # (.nwb/.zarr/.ngff and videos) and exposes no CLI flag to widen that, so
-    # the JSON sidecar would be silently skipped. Call the Python API in the
-    # deployment venv instead: allow_any_path=True uploads every file, and
-    # validation is skipped because neither file is an NWB asset.
-    upload_script = (
-        "import sys; from dandi.upload import UploadValidation, upload; "
-        "upload(validation=UploadValidation.SKIP, dandi_instance=sys.argv[1], allow_any_path=True)"
-    )
-    cmd = [VENV_PYTHON, "-c", upload_script, DANDI_INSTANCE]
+    # By default `dandi upload` only discovers recognized asset types
+    # (.nwb/.zarr/.ngff and videos), silently skipping the JSON sidecar.
+    # --allow-any-path uploads every file, but it is a development option that
+    # only exists when DANDI_DEVEL=1 is set in the environment. Validation is
+    # skipped because neither file is an NWB asset.
+    env["DANDI_DEVEL"] = "1"
+    cmd = [DANDI_BIN, "upload", "--allow-any-path", "--validation", "skip", "--dandi-instance", DANDI_INSTANCE]
     lock_path = CLIPS_DANDISET_ROOT / "derivatives" / "upload.lock"
     try:
         with filelock.FileLock(lock_path, timeout=DANDI_UPLOAD_TIMEOUT_SECONDS):

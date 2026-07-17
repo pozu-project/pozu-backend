@@ -306,7 +306,7 @@ def test_upload_clip_to_dandi_deletes_local_copies_on_success(staged_clip_paths,
     commands = []
 
     def fake_run(cmd, **kwargs):
-        commands.append((cmd, kwargs.get("cwd")))
+        commands.append((cmd, kwargs.get("cwd"), kwargs.get("env", {})))
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(pozu_flask_app.subprocess, "run", fake_run)
@@ -314,16 +314,20 @@ def test_upload_clip_to_dandi_deletes_local_copies_on_success(staged_clip_paths,
     pozu_flask_app.upload_clip_to_dandi(staged_clip_paths)
 
     assert len(commands) == 1
-    cmd, cwd = commands[0]
+    cmd, cwd, env = commands[0]
     assert cwd == pozu_flask_app.CLIPS_DANDISET_ROOT
-    # The upload runs the dandi Python API (not the CLI) so allow_any_path can
-    # be set, which the CLI does not expose; without it the .json sidecar is
-    # silently skipped.
-    assert cmd[0] == pozu_flask_app.VENV_PYTHON
-    assert cmd[-1] == pozu_flask_app.DANDI_INSTANCE
-    script = cmd[2]
-    assert "allow_any_path=True" in script
-    assert "UploadValidation.SKIP" in script
+    assert cmd == [
+        pozu_flask_app.DANDI_BIN,
+        "upload",
+        "--allow-any-path",
+        "--validation",
+        "skip",
+        "--dandi-instance",
+        pozu_flask_app.DANDI_INSTANCE,
+    ]
+    # --allow-any-path (needed so the .json sidecar is not silently skipped)
+    # is a development option that only exists when DANDI_DEVEL=1 is set.
+    assert env.get("DANDI_DEVEL") == "1"
     # No local copies survive the upload.
     assert all(not path.exists() for path in staged_clip_paths)
 
