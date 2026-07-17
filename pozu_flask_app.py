@@ -292,6 +292,24 @@ def require_auth(handler, /):
     return wrapper
 
 
+def resolve_optional_identity() -> str:
+    """Best-effort submitter identity from an optional ``Authorization`` header.
+
+    Routes that do not require sign-in still benefit from attribution when the
+    frontend happens to send a valid app JWT. A missing, malformed, invalid, or
+    expired token silently resolves to ``"anonymous"`` instead of rejecting.
+    """
+    header = flask.request.headers.get("Authorization", "")
+    scheme, _, token = header.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        return "anonymous"
+    try:
+        claims = decode_app_token(token)
+    except jwt.PyJWTError:
+        return "anonymous"
+    return claims.get("login") or claims["sub"]
+
+
 # =============================================================================
 # BBox namespace
 # =============================================================================
@@ -757,7 +775,10 @@ def upload_clip_to_dandi(clip_paths, /) -> None:
 
 clips_ns = flask_restx.Namespace(
     "clips",
-    description="Accept a pre-encoded MP4 clip (vetted via ffprobe) and upload it to DANDI",
+    description=(
+        "Accept a pre-encoded MP4 clip (vetted via ffprobe) and upload it to DANDI. "
+        "No sign-in is required at this time; the upload uses the server-stored DANDI credentials."
+    ),
 )
 
 clip_request = clips_ns.model(
@@ -792,11 +813,13 @@ clip_response = clips_ns.model(
 
 @clips_ns.route("")
 class VideoClip(flask_restx.Resource):
-    @require_auth
+    # Unlike the annotation routes, a JWT is deliberately NOT required here for
+    # now; the DANDI upload authenticates with the server-stored API key. A
+    # valid Bearer token, when sent, still attributes the clip to its submitter.
     @clips_ns.expect(clip_request, validate=False)
     @clips_ns.marshal_with(clip_response, code=http.HTTPStatus.CREATED)
     def post(self):
-        """Accept a pre-encoded MP4 clip and upload it to DANDI synchronously."""
+        """Accept a pre-encoded MP4 clip and upload it to DANDI synchronously. No sign-in required."""
         body = flask.request.get_json(silent=True)
         if not isinstance(body, dict):
             raise BadRequest("Request body must be a JSON object")
@@ -811,7 +834,7 @@ class VideoClip(flask_restx.Resource):
         mp4_blob = decode_clip_mp4(body.get("mp4"))
 
         submission_id = uuid.uuid4().hex
-        submitted_by = flask.g.user.get("login") or flask.g.user["sub"]
+        submitted_by = resolve_optional_identity()
         hour_tag = datetime.datetime.utcnow().strftime("%Y-%m-%d-%H")
         clip_filename = f"{hour_tag}-{submission_id}.mp4"
 

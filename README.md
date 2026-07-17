@@ -35,6 +35,8 @@ from a bash console.
 
 `POST /api/v1/clips` accepts a small, fully-encoded MP4 file as base64 (bare base64 or a `data:video/mp4;base64,` URL) in the `mp4` field, alongside the usual `video_url`. The server verifies the bytes with `ffprobe` (they must contain a decodable video stream), writes the clip plus a JSON provenance sidecar into dandiset `000474`, and runs `dandi upload` synchronously inside the request. There is no buffer and no cron involvement for clips.
 
+Unlike the annotation routes, no sign-in is required for clips at this time. The DANDI upload authenticates with the server-stored API key, and the provenance sidecar records the submitter as `anonymous` unless the request happens to carry a valid `Authorization: Bearer` token.
+
 On success the response is a `201` with `push_status: "uploaded"` and the local copies are deleted immediately, so clips never accumulate on the PythonAnywhere disk. The DANDI archive is their system of record. On a failed upload the local copies are also deleted and the response is a `502`; the client still holds the original bytes and simply retries the request. Scratch bytes during validation live in a temporary directory that is always removed, even on rejection.
 
 Requirements on the deployment. `ffprobe` must be installed (PythonAnywhere ships it at `/usr/bin/ffprobe`; override with the `FFPROBE_BIN` env var if needed) and dandiset `000474` must be provisioned at `/home/CodyCBakerPhD/mysite/000474` (a `dandiset.yaml` plus a `derivatives/` tree) the same way as the other dandisets. The `/api/v1/health` endpoint reports whether `ffprobe` is present.

@@ -70,19 +70,32 @@ def _auth_headers():
     return {"Authorization": f"Bearer {token}"}
 
 
+# No sign-in is required for clips at this time; the DANDI upload authenticates
+# with the server-stored API key. Attribution is still best-effort from an
+# optional Bearer token.
 @pytest.mark.ai_generated
-def test_rejects_unauthenticated_request(client):
-    response = client.post(ENDPOINT, json=_clip_body())
+@pytest.mark.parametrize(
+    ("headers_factory", "expected_submitted_by"),
+    [
+        pytest.param(dict, "anonymous", id="no-header"),
+        pytest.param(lambda: {"Authorization": "token abc"}, "anonymous", id="malformed-header"),
+        pytest.param(lambda: {"Authorization": "Bearer not-a-real-jwt"}, "anonymous", id="invalid-token"),
+        pytest.param(_auth_headers, "octocat", id="valid-token"),
+    ],
+)
+def test_accepts_request_with_optional_identity(client, captured, headers_factory, expected_submitted_by):
+    written, _ = captured
+    response = client.post(ENDPOINT, json=_clip_body(), headers=headers_factory())
 
-    assert response.status_code == http.HTTPStatus.UNAUTHORIZED
-    assert "message" in response.get_json()
+    assert response.status_code == http.HTTPStatus.CREATED
+    assert written[0]["record"]["submitted_by"] == expected_submitted_by
 
 
 @pytest.mark.ai_generated
-def test_unauthorized_response_carries_cors_header(client):
+def test_response_carries_cors_header(client):
     response = client.post(ENDPOINT, json=_clip_body(), headers={"Origin": ALLOWED_ORIGIN})
 
-    assert response.status_code == http.HTTPStatus.UNAUTHORIZED
+    assert response.status_code == http.HTTPStatus.CREATED
     assert response.headers.get("Access-Control-Allow-Origin") == ALLOWED_ORIGIN
 
 
