@@ -318,6 +318,7 @@ def test_upload_clip_to_dandi_deletes_local_copies_on_success(staged_clip_paths,
             [
                 pozu_flask_app.DANDI_BIN,
                 "upload",
+                "--allow-any-path",
                 "--validation",
                 "skip",
                 "--dandi-instance",

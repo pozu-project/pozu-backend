@@ -756,9 +756,11 @@ def upload_clip_to_dandi(clip_paths, /) -> None:
     env = os.environ.copy()
     env["EMBER_DANDI_API_KEY"] = EMBER_DANDI_API_KEY
     env["PATH"] = f"{VENV_BIN}:{env.get('PATH', '')}"
-    # The MP4 and its JSON sidecar are not NWB assets, so DANDI's asset
-    # validation must be skipped for the pair to upload.
-    cmd = [DANDI_BIN, "upload", "--validation", "skip", "--dandi-instance", DANDI_INSTANCE]
+    # The MP4 and its JSON sidecar are not NWB assets: validation must be
+    # skipped for the pair to upload, and --allow-any-path is required or the
+    # CLI silently ignores the .json (it only picks up recognized asset types
+    # like NWB and video files by default).
+    cmd = [DANDI_BIN, "upload", "--allow-any-path", "--validation", "skip", "--dandi-instance", DANDI_INSTANCE]
     lock_path = CLIPS_DANDISET_ROOT / "derivatives" / "upload.lock"
     try:
         with filelock.FileLock(lock_path, timeout=DANDI_UPLOAD_TIMEOUT_SECONDS):
