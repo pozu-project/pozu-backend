@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import secrets
 import shutil
 import subprocess
@@ -718,8 +719,9 @@ def write_clip_files(*, mp4_blob, record, clip_filename) -> list[pathlib.Path]:
             raise BadRequest("'mp4' is not a decodable video: " + " | ".join(stderr_tail or ["no video stream found"]))
 
         # The sidecar keeps the uploaded clip attributable to its source video
-        # and submitter without a separate JSONL buffer.
-        sidecar_path = upload_dir / f"{clip_filename}.json"
+        # and submitter without a separate JSONL buffer. It shares the clip's
+        # name so the pair sit side by side in the archive (X.mp4 + X.json).
+        sidecar_path = upload_dir / (clip_filename.removesuffix(".mp4") + ".json")
         sidecar_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
         partial_path = upload_dir / f"{clip_filename}.part"
@@ -796,7 +798,27 @@ clip_request = clips_ns.model(
         ),
         "filename": flask_restx.fields.String(
             required=False,
-            description="Original name of the video file, recorded in the provenance sidecar",
+            description=(
+                "Original name of the video file. Recorded in the provenance sidecar and used "
+                "as the base of the uploaded clip's name"
+            ),
+        ),
+        "author": flask_restx.fields.String(
+            required=False,
+            description="Free-text, self-reported submitter name (distinct from the JWT-derived submitted_by)",
+        ),
+        "frame_start": flask_restx.fields.Integer(
+            required=False,
+            min=0,
+            description=(
+                "First frame (inclusive) of the subset this clip covers in the original video. "
+                "Provide together with 'frame_end'; reflected in the uploaded clip's name"
+            ),
+        ),
+        "frame_end": flask_restx.fields.Integer(
+            required=False,
+            min=0,
+            description="Last frame (inclusive) of the subset this clip covers. Provide together with 'frame_start'",
         ),
         "timestamp": flask_restx.fields.String(required=False),
     },
@@ -834,19 +856,49 @@ class VideoClip(flask_restx.Resource):
         if filename is not None:
             if not isinstance(filename, str) or not filename.strip():
                 raise BadRequest("'filename' must be a non-empty string when provided")
-            # Provenance only; strip any path components so the sidecar never
-            # carries traversal-looking values.
+            # Strip any path components so neither the sidecar nor the uploaded
+            # clip's name ever carries traversal-looking values.
             filename = pathlib.PurePosixPath(filename.replace("\\", "/")).name[:255]
+
+        author = body.get("author")
+        if author is not None:
+            if not isinstance(author, str) or not author.strip():
+                raise BadRequest("'author' must be a non-empty string when provided")
+            author = author.strip()[:255]
+
+        frame_start = body.get("frame_start")
+        frame_end = body.get("frame_end")
+        if (frame_start is None) != (frame_end is None):
+            raise BadRequest("'frame_start' and 'frame_end' must be provided together")
+        if frame_start is not None:
+            for name, value in (("frame_start", frame_start), ("frame_end", frame_end)):
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    raise BadRequest(f"'{name}' must be a non-negative integer")
+            if frame_start > frame_end:
+                raise BadRequest("'frame_start' must not be greater than 'frame_end'")
 
         submission_id = uuid.uuid4().hex
         submitted_by = resolve_optional_identity()
         hour_tag = datetime.datetime.utcnow().strftime("%Y-%m-%d-%H")
-        clip_filename = f"{hour_tag}-{submission_id}.mp4"
+
+        # Name the uploaded clip after the original video, tagged with the frame
+        # subset it covers. A short submission-id suffix keeps names unique so
+        # two clips of the same range can never collide in the archive. Without
+        # a client filename, fall back to the hour tag + full submission id.
+        frames_tag = f"_frames-{frame_start}-{frame_end}" if frame_start is not None else ""
+        if filename:
+            safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "-", pathlib.PurePosixPath(filename).stem).strip("-.") or "clip"
+            clip_filename = f"{safe_stem}{frames_tag}_{submission_id[:8]}.mp4"
+        else:
+            clip_filename = f"{hour_tag}-{submission_id}{frames_tag}.mp4"
 
         record: dict = {
             "submission_id": submission_id,
             "submitted_by": submitted_by,
+            "author": author,
             "filename": filename,
+            "frame_start": frame_start,
+            "frame_end": frame_end,
             "clip_file": clip_filename,
             "clip_size_bytes": len(mp4_blob),
             "timestamp": body.get("timestamp"),

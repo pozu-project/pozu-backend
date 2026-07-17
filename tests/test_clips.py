@@ -4,6 +4,7 @@ import base64
 import http
 import json
 import pathlib
+import re
 import shutil
 import subprocess
 import types
@@ -36,7 +37,7 @@ def captured(monkeypatch):
     def fake_write_clip_files(**kwargs):
         written.append(kwargs)
         clip_path = pathlib.Path("clips") / kwargs["clip_filename"]
-        return [clip_path, clip_path.with_suffix(".mp4.json")]
+        return [clip_path, clip_path.with_suffix(".json")]
 
     monkeypatch.setattr(pozu_flask_app, "write_clip_files", fake_write_clip_files)
     monkeypatch.setattr(pozu_flask_app, "upload_clip_to_dandi", lambda clip_paths: uploaded.append(clip_paths))
@@ -120,9 +121,11 @@ def test_accepts_and_uploads_valid_clip(client, captured, mp4_value):
     assert record["clip_file"] == payload["clip_file"]
     assert record["clip_size_bytes"] == len(FAKE_MP4)
 
-    # The upload runs synchronously on the exact files that were written.
+    # The upload runs synchronously on the exact files that were written; the
+    # sidecar shares the clip's name (X.mp4 + X.json).
     assert len(uploaded) == 1
-    assert [path.name for path in uploaded[0]] == [payload["clip_file"], payload["clip_file"] + ".json"]
+    expected_sidecar = payload["clip_file"].removesuffix(".mp4") + ".json"
+    assert [path.name for path in uploaded[0]] == [payload["clip_file"], expected_sidecar]
 
 
 @pytest.mark.ai_generated
@@ -171,6 +174,85 @@ def test_filename_is_recorded_in_provenance(client, captured, provided, recorded
 
 
 @pytest.mark.ai_generated
+def test_clip_named_after_original_video_and_frame_subset(client, captured):
+    written, _ = captured
+    body = _clip_body(filename="mice.mp4", frame_start=100, frame_end=180)
+
+    response = client.post(ENDPOINT, json=body, headers=_auth_headers())
+
+    assert response.status_code == http.HTTPStatus.CREATED
+    clip_file = response.get_json()["clip_file"]
+    # Original stem + frame subset + short uniqueness suffix.
+    assert re.fullmatch(r"mice_frames-100-180_[0-9a-f]{8}\.mp4", clip_file)
+    record = written[0]["record"]
+    assert record["frame_start"] == 100
+    assert record["frame_end"] == 180
+    assert record["clip_file"] == clip_file
+
+
+@pytest.mark.ai_generated
+def test_clip_named_after_original_video_without_frames(client, captured):
+    _, _ = captured
+    response = client.post(ENDPOINT, json=_clip_body(filename="my mice video.mp4"), headers=_auth_headers())
+
+    assert response.status_code == http.HTTPStatus.CREATED
+    # Unsafe characters collapse to '-'; no frames tag when no subset is given.
+    assert re.fullmatch(r"my-mice-video_[0-9a-f]{8}\.mp4", response.get_json()["clip_file"])
+
+
+@pytest.mark.ai_generated
+def test_clip_name_falls_back_to_submission_id_without_filename(client, captured):
+    _, _ = captured
+    response = client.post(ENDPOINT, json=_clip_body(), headers=_auth_headers())
+
+    assert response.status_code == http.HTTPStatus.CREATED
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}-\d{2}-[0-9a-f]{32}\.mp4", response.get_json()["clip_file"])
+
+
+@pytest.mark.ai_generated
+def test_author_is_recorded_in_provenance(client, captured):
+    written, _ = captured
+    body = _clip_body(author="  Talmo Pereira  ")
+
+    response = client.post(ENDPOINT, json=body, headers=_auth_headers())
+
+    assert response.status_code == http.HTTPStatus.CREATED
+    assert written[0]["record"]["author"] == "Talmo Pereira"
+
+
+@pytest.mark.ai_generated
+def test_omitted_author_is_recorded_as_none(client, captured):
+    written, _ = captured
+    response = client.post(ENDPOINT, json=_clip_body(), headers=_auth_headers())
+
+    assert response.status_code == http.HTTPStatus.CREATED
+    assert written[0]["record"]["author"] is None
+
+
+@pytest.mark.ai_generated
+@pytest.mark.parametrize(
+    ("overrides", "message_snippet"),
+    [
+        pytest.param({"author": "   "}, "author", id="blank-author"),
+        pytest.param({"author": 42}, "author", id="author-not-a-string"),
+        pytest.param({"frame_start": 5}, "together", id="frame-start-without-end"),
+        pytest.param({"frame_end": 5}, "together", id="frame-end-without-start"),
+        pytest.param({"frame_start": -1, "frame_end": 5}, "non-negative", id="negative-frame"),
+        pytest.param({"frame_start": "0", "frame_end": 5}, "non-negative", id="frame-not-an-integer"),
+        pytest.param({"frame_start": 9, "frame_end": 5}, "greater", id="start-after-end"),
+    ],
+)
+def test_invalid_author_and_frame_fields_are_rejected(client, captured, overrides, message_snippet):
+    written, uploaded = captured
+    response = client.post(ENDPOINT, json=_clip_body(**overrides), headers=_auth_headers())
+
+    assert response.status_code == http.HTTPStatus.BAD_REQUEST
+    assert message_snippet in response.get_json()["message"]
+    assert written == []
+    assert uploaded == []
+
+
+@pytest.mark.ai_generated
 def test_blank_filename_is_rejected(client, captured):
     written, _ = captured
     response = client.post(ENDPOINT, json=_clip_body(filename="   "), headers=_auth_headers())
@@ -214,7 +296,7 @@ def staged_clip_paths(tmp_path, monkeypatch):
     upload_dir.mkdir(parents=True)
     clip_path = upload_dir / "test-clip.mp4"
     clip_path.write_bytes(FAKE_MP4)
-    sidecar_path = upload_dir / "test-clip.mp4.json"
+    sidecar_path = upload_dir / "test-clip.json"
     sidecar_path.write_text("{}\n")
     return [clip_path, sidecar_path]
 
@@ -314,7 +396,7 @@ def test_write_clip_files_accepts_real_video(tmp_path, monkeypatch):
     assert clip_path.read_bytes() == mp4_blob
     assert json.loads(sidecar_path.read_text()) == record
     # Only the clip and its sidecar remain; no .part staging file or scratch bytes.
-    assert sorted(entry.name for entry in upload_dir.iterdir()) == ["real-clip.mp4", "real-clip.mp4.json"]
+    assert sorted(entry.name for entry in upload_dir.iterdir()) == ["real-clip.json", "real-clip.mp4"]
 
 
 @pytest.mark.ai_generated
