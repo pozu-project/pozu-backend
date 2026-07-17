@@ -31,16 +31,13 @@ pip install flask flask-restx flask-cors requests filelock dandi pyjwt
 from a bash console.
 
 
-### Video clips (ffmpeg)
+### Video clips
 
-`POST /api/v1/clips` accepts an MP4 clip for dandiset `000474` and uploads it to DANDI synchronously inside the request (`push_status: "uploaded"`). If the upload fails, the clip stays buffered on disk and the hourly `cron_snapshot.py` retries it (`push_status: "queued"`). The endpoint accepts exactly one of two payload shapes.
+`POST /api/v1/clips` accepts a small, fully-encoded MP4 file as base64 (bare base64 or a `data:video/mp4;base64,` URL) in the `mp4` field, alongside the usual `video_url`. The server verifies the bytes with `ffprobe` (they must contain a decodable video stream), writes the clip plus a JSON provenance sidecar into dandiset `000474`, and runs `dandi upload` synchronously inside the request. There is no buffer and no cron involvement for clips.
 
--   `frames` plus encoding parameters (`fps`, optional `codec`, `crf`, `width`/`height`). A few base64-encoded PNG or JPEG frames that the server assembles into an MP4 with `ffmpeg`.
--   `mp4`. A small pre-encoded MP4 file as base64, stored as-is. The server verifies it with `ffprobe` (it must contain a decodable video stream) before accepting it, and the re-encode parameters above are rejected alongside it since nothing is re-encoded.
+On success the response is a `201` with `push_status: "uploaded"` and the local copies are deleted immediately, so clips never accumulate on the PythonAnywhere disk. The DANDI archive is their system of record. On a failed upload the local copies are also deleted and the response is a `502`; the client still holds the original bytes and simply retries the request. Scratch bytes during validation live in a temporary directory that is always removed, even on rejection.
 
-The frames and the in-progress MP4 are written to a temporary directory that is always deleted, even on failure. After a successful DANDI upload (synchronous or via the cron retry), the local MP4 is deleted as well, so clips never accumulate on the PythonAnywhere disk. The DANDI archive is their system of record.
-
-Requirements on the deployment. `ffmpeg` and `ffprobe` must be installed (PythonAnywhere ships them at `/usr/bin/ffmpeg` and `/usr/bin/ffprobe`; override with the `FFMPEG_BIN` / `FFPROBE_BIN` env vars if needed) and dandiset `000474` must be provisioned at `/home/CodyCBakerPhD/mysite/000474` (a `dandiset.yaml` plus a `derivatives/` tree) the same way as the other dandisets. The `/api/v1/health` endpoint reports whether both binaries are present.
+Requirements on the deployment. `ffprobe` must be installed (PythonAnywhere ships it at `/usr/bin/ffprobe`; override with the `FFPROBE_BIN` env var if needed) and dandiset `000474` must be provisioned at `/home/CodyCBakerPhD/mysite/000474` (a `dandiset.yaml` plus a `derivatives/` tree) the same way as the other dandisets. The `/api/v1/health` endpoint reports whether `ffprobe` is present.
 
 ### GitHub OAuth
 
