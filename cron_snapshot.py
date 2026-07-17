@@ -98,8 +98,11 @@ def stage_completed_buffers(dandiset_root: pathlib.Path, current_hour_tag: str) 
 def stage_clip_files(dandiset_root, /) -> list[pathlib.Path]:
     """Move finished MP4 clips from buffer/ to incoming/. Returns moved file paths.
 
-    The web app renames each clip into buffer/ atomically, so every ``*.mp4``
-    seen here is complete and safe to stage regardless of the hour tag.
+    Clips normally upload to DANDI synchronously inside the web request, so this
+    sweep is the retry path: any ``*.mp4`` still sitting in buffer/ is a clip
+    whose synchronous upload failed. The web app renames each clip into buffer/
+    atomically, so every ``*.mp4`` seen here is complete and safe to stage
+    regardless of the hour tag.
     """
     buffer_dir = dandiset_root / "derivatives" / "buffer"
     if not buffer_dir.exists():

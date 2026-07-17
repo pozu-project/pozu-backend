@@ -123,6 +123,9 @@ FFMPEG_BIN = os.environ.get("FFMPEG_BIN") or shutil.which("ffmpeg") or "/usr/bin
 # ffprobe ships in the same package as ffmpeg; it vets pre-encoded MP4 uploads.
 FFPROBE_BIN = os.environ.get("FFPROBE_BIN") or shutil.which("ffprobe") or "/usr/bin/ffprobe"
 FFMPEG_TIMEOUT_SECONDS = 120
+# Clips upload to DANDI synchronously inside the request (latency is acceptable
+# for this route); the hourly cron only acts as the retry path for failures.
+DANDI_UPLOAD_TIMEOUT_SECONDS = 300
 
 MAX_CLIP_FRAMES = 64
 MAX_CLIP_FRAME_BYTES = 5 * 1024 * 1024
@@ -878,6 +881,53 @@ def write_uploaded_clip_mp4(*, mp4_blob, clip_filename) -> pathlib.Path:
     return final_path
 
 
+def upload_clip_to_dandi(clip_path, /) -> str:
+    """Upload a finished clip to DANDI synchronously, reclaiming disk on success.
+
+    Moves the clip from buffer/ to incoming/ and runs ``dandi upload`` inside the
+    clips dandiset (serialized across workers with a file lock). On success the
+    local MP4 is deleted, since the DANDI archive is its system of record, and
+    ``"uploaded"`` is returned. On any failure the clip moves back to buffer/ so
+    the hourly ``cron_snapshot.py`` retries it, and ``"queued"`` is returned.
+    """
+    incoming_dir = CLIPS_DANDISET_ROOT / "derivatives" / "incoming"
+    incoming_dir.mkdir(parents=True, exist_ok=True)
+    staged_path = incoming_dir / clip_path.name
+    clip_path.replace(staged_path)
+
+    env = os.environ.copy()
+    env["EMBER_DANDI_API_KEY"] = EMBER_DANDI_API_KEY
+    env["PATH"] = f"{VENV_BIN}:{env.get('PATH', '')}"
+    cmd = [DANDI_BIN, "upload", "--dandi-instance", DANDI_INSTANCE]
+    lock_path = CLIPS_DANDISET_ROOT / "derivatives" / "upload.lock"
+    try:
+        with filelock.FileLock(lock_path, timeout=DANDI_UPLOAD_TIMEOUT_SECONDS):
+            proc = subprocess.run(
+                cmd,
+                cwd=CLIPS_DANDISET_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=DANDI_UPLOAD_TIMEOUT_SECONDS,
+                check=False,
+            )
+        returncode = proc.returncode
+        if returncode != 0:
+            logger.error("dandi upload failed rc=%d for %s\nstderr: %s", returncode, clip_path.name, proc.stderr)
+    except (subprocess.TimeoutExpired, filelock.Timeout, OSError):
+        logger.exception("dandi upload errored for %s", clip_path.name)
+        returncode = -1
+
+    if returncode == 0:
+        staged_path.unlink(missing_ok=True)
+        logger.info("Uploaded clip %s to DANDI and deleted the local copy", clip_path.name)
+        return "uploaded"
+
+    staged_path.replace(clip_path)
+    logger.warning("Clip %s returned to buffer for the hourly retry", clip_path.name)
+    return "queued"
+
+
 clips_ns = flask_restx.Namespace(
     "clips",
     description=(
@@ -940,7 +990,12 @@ clip_response = clips_ns.model(
         "submission_id": flask_restx.fields.String,
         "clip_file": flask_restx.fields.String,
         "frame_count": flask_restx.fields.Integer,
-        "push_status": flask_restx.fields.String,
+        "push_status": flask_restx.fields.String(
+            description=(
+                "'uploaded' when the synchronous DANDI upload succeeded (the local copy is "
+                "deleted); 'queued' when it failed and the clip waits for the hourly retry"
+            ),
+        ),
     },
 )
 
@@ -951,7 +1006,7 @@ class VideoClip(flask_restx.Resource):
     @clips_ns.expect(clip_request, validate=False)
     @clips_ns.marshal_with(clip_response, code=http.HTTPStatus.ACCEPTED)
     def post(self):
-        """Queue an MP4 clip (assembled from posted frames, or uploaded pre-encoded) for the next hourly DANDI upload."""
+        """Accept an MP4 clip (assembled from posted frames, or uploaded pre-encoded) and upload it to DANDI."""
         body = flask.request.get_json(silent=True)
         if not isinstance(body, dict):
             raise BadRequest("Request body must be a JSON object")
@@ -1019,14 +1074,22 @@ class VideoClip(flask_restx.Resource):
         }
         buffer_dir = CLIPS_DANDISET_ROOT / "derivatives" / "buffer"
         append_to_hourly_jsonl(record, buffer_dir)
-        logger.info("Queued clip submission_id=%s content_id=%s file=%s", submission_id, content_id, clip_path.name)
+
+        push_status = upload_clip_to_dandi(clip_path)
+        logger.info(
+            "Clip submission_id=%s content_id=%s file=%s push_status=%s",
+            submission_id,
+            content_id,
+            clip_path.name,
+            push_status,
+        )
 
         return {
             "content_id": content_id,
             "submission_id": submission_id,
             "clip_file": clip_path.name,
             "frame_count": frame_count,
-            "push_status": "queued",
+            "push_status": push_status,
         }, http.HTTPStatus.ACCEPTED
 
 

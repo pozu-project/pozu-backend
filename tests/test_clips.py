@@ -5,6 +5,7 @@ import http
 import pathlib
 import shutil
 import struct
+import types
 import zlib
 
 import pytest
@@ -66,6 +67,7 @@ def captured(monkeypatch):
 
     monkeypatch.setattr(pozu_flask_app, "write_clip_mp4", fake_write_clip_mp4)
     monkeypatch.setattr(pozu_flask_app, "write_uploaded_clip_mp4", fake_write_uploaded_clip_mp4)
+    monkeypatch.setattr(pozu_flask_app, "upload_clip_to_dandi", lambda clip_path: "uploaded")
     return records, clips, uploads
 
 
@@ -115,7 +117,7 @@ def test_accepts_valid_clip(client, captured):
 
     assert response.status_code == http.HTTPStatus.ACCEPTED
     payload = response.get_json()
-    assert payload["push_status"] == "queued"
+    assert payload["push_status"] == "uploaded"
     assert payload["content_id"] == CONTENT_ID
     assert payload["frame_count"] == 3
     assert payload["clip_file"].endswith(".mp4")
@@ -266,7 +268,7 @@ def test_accepts_uploaded_mp4(client, captured, mp4_value):
 
     assert response.status_code == http.HTTPStatus.ACCEPTED
     payload = response.get_json()
-    assert payload["push_status"] == "queued"
+    assert payload["push_status"] == "uploaded"
     assert payload["content_id"] == CONTENT_ID
     assert payload["frame_count"] is None
     assert payload["clip_file"].endswith(".mp4")
@@ -327,6 +329,64 @@ def test_oversized_mp4_is_rejected(client, captured, monkeypatch):
     assert "byte limit" in response.get_json()["message"]
     assert records == []
     assert uploads == []
+
+
+@pytest.fixture
+def buffered_clip(tmp_path, monkeypatch):
+    """A clip file sitting in a temp clips-dandiset buffer, ready for upload."""
+    monkeypatch.setattr(pozu_flask_app, "CLIPS_DANDISET_ROOT", tmp_path / "000474")
+    buffer_dir = tmp_path / "000474" / "derivatives" / "buffer"
+    buffer_dir.mkdir(parents=True)
+    clip_path = buffer_dir / "test-clip.mp4"
+    clip_path.write_bytes(FAKE_MP4)
+    return clip_path
+
+
+@pytest.mark.ai_generated
+def test_upload_clip_to_dandi_deletes_local_copy_on_success(buffered_clip, monkeypatch):
+    commands = []
+
+    def fake_run(cmd, **kwargs):
+        commands.append((cmd, kwargs.get("cwd")))
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pozu_flask_app.subprocess, "run", fake_run)
+
+    status = pozu_flask_app.upload_clip_to_dandi(buffered_clip)
+
+    assert status == "uploaded"
+    assert commands == [
+        (
+            [pozu_flask_app.DANDI_BIN, "upload", "--dandi-instance", pozu_flask_app.DANDI_INSTANCE],
+            pozu_flask_app.CLIPS_DANDISET_ROOT,
+        )
+    ]
+    # The local MP4 is deleted everywhere after a successful upload.
+    assert not buffered_clip.exists()
+    incoming_dir = pozu_flask_app.CLIPS_DANDISET_ROOT / "derivatives" / "incoming"
+    assert list(incoming_dir.glob("*.mp4")) == []
+
+
+@pytest.mark.ai_generated
+@pytest.mark.parametrize(
+    "fake_run",
+    [
+        pytest.param(
+            lambda cmd, **kwargs: types.SimpleNamespace(returncode=1, stdout="", stderr="boom"), id="nonzero-rc"
+        ),
+        pytest.param(lambda cmd, **kwargs: (_ for _ in ()).throw(OSError("dandi missing")), id="oserror"),
+    ],
+)
+def test_upload_clip_to_dandi_requeues_clip_on_failure(buffered_clip, monkeypatch, fake_run):
+    monkeypatch.setattr(pozu_flask_app.subprocess, "run", fake_run)
+
+    status = pozu_flask_app.upload_clip_to_dandi(buffered_clip)
+
+    assert status == "queued"
+    # The clip is back in buffer/ so cron_snapshot.py retries it hourly.
+    assert buffered_clip.exists()
+    incoming_dir = pozu_flask_app.CLIPS_DANDISET_ROOT / "derivatives" / "incoming"
+    assert list(incoming_dir.glob("*.mp4")) == []
 
 
 requires_ffmpeg = pytest.mark.skipif(
