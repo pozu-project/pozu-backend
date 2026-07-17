@@ -120,11 +120,14 @@ LOG_LEVEL = "INFO"
 
 # -- Clip encoding (ffmpeg) ---------------------------------------------------
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN") or shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
+# ffprobe ships in the same package as ffmpeg; it vets pre-encoded MP4 uploads.
+FFPROBE_BIN = os.environ.get("FFPROBE_BIN") or shutil.which("ffprobe") or "/usr/bin/ffprobe"
 FFMPEG_TIMEOUT_SECONDS = 120
 
 MAX_CLIP_FRAMES = 64
 MAX_CLIP_FRAME_BYTES = 5 * 1024 * 1024
 MAX_CLIP_TOTAL_BYTES = 64 * 1024 * 1024
+MAX_CLIP_MP4_BYTES = 64 * 1024 * 1024
 CLIP_MIN_FPS = 0.1
 CLIP_MAX_FPS = 120.0
 CLIP_CODECS = ("libx264", "libx265")
@@ -144,6 +147,12 @@ MAX_CONTENT_LENGTH_BYTES = 96 * 1024 * 1024
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 JPEG_MAGIC = b"\xff\xd8\xff"
+# ISO BMFF (MP4) files carry an 'ftyp' box tag at byte offset 4.
+MP4_FTYP_TAG = b"ftyp"
+
+# The five ffmpeg re-encode parameters; they have no meaning for a pre-encoded
+# MP4 upload, so their presence alongside 'mp4' is rejected as client confusion.
+CLIP_ENCODING_PARAMETER_NAMES = ("fps", "codec", "crf", "width", "height")
 
 # TODO: replace with HTTP call to ember-cache once that URL exists.
 CONTENT_ID_TO_DANDI_PATH = {
@@ -799,9 +808,82 @@ def write_clip_mp4(*, frame_blobs, frame_extension, fps, codec, crf, scale_filte
     return final_path
 
 
+def decode_clip_mp4(mp4_value, /) -> bytes:
+    """Validate and decode a pre-encoded MP4 posted as base64.
+
+    Accepts a bare base64 payload or a ``data:video/mp4;base64,`` URL. Enforces
+    the byte budget and requires the ISO BMFF 'ftyp' signature; deeper validation
+    (is this actually a decodable video?) happens via ffprobe before the bytes
+    are accepted into the buffer.
+    """
+    if not isinstance(mp4_value, str) or not mp4_value:
+        raise BadRequest("'mp4' must be a base64-encoded string")
+    payload = mp4_value.partition(",")[2] if mp4_value.startswith("data:") else mp4_value
+    try:
+        blob = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError):
+        raise BadRequest("'mp4' is not valid base64")
+
+    if len(blob) > MAX_CLIP_MP4_BYTES:
+        raise BadRequest(f"'mp4' exceeds the {MAX_CLIP_MP4_BYTES} byte limit")
+    if len(blob) < 12 or blob[4:8] != MP4_FTYP_TAG:
+        raise BadRequest("'mp4' does not look like an MP4 file (missing ftyp signature)")
+    return blob
+
+
+def write_uploaded_clip_mp4(*, mp4_blob, clip_filename) -> pathlib.Path:
+    """Vet pre-encoded MP4 bytes with ffprobe and land them in the clips buffer.
+
+    The bytes are first written to a temporary directory that is always removed,
+    success or failure. ffprobe must find a decodable video stream, so arbitrary
+    bytes wearing an ftyp header are rejected before they can reach DANDI. The
+    vetted file then lands beside its destination and is renamed into place, so
+    ``cron_snapshot.py`` can only ever see complete ``*.mp4`` files.
+    """
+    buffer_dir = CLIPS_DANDISET_ROOT / "derivatives" / "buffer"
+    buffer_dir.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="pozu-clip-") as tmp:
+        tmp_output = pathlib.Path(tmp) / clip_filename
+        tmp_output.write_bytes(mp4_blob)
+
+        cmd = [
+            FFPROBE_BIN,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(tmp_output),
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SECONDS, check=False)
+        except subprocess.TimeoutExpired:
+            raise BadRequest(f"ffprobe timed out after {FFMPEG_TIMEOUT_SECONDS}s while validating the clip")
+        codec_name = (proc.stdout or "").strip()
+        if proc.returncode != 0 or not codec_name:
+            stderr_tail = (proc.stderr or "").strip().splitlines()[-3:]
+            logger.warning("ffprobe rejected %s rc=%d: %s", clip_filename, proc.returncode, proc.stderr)
+            raise BadRequest("'mp4' is not a decodable video: " + " | ".join(stderr_tail or ["no video stream found"]))
+
+        partial_path = buffer_dir / f"{clip_filename}.part"
+        final_path = buffer_dir / clip_filename
+        shutil.move(str(tmp_output), str(partial_path))
+        partial_path.replace(final_path)
+
+    logger.info("Accepted uploaded clip %s (codec=%s, %d bytes)", clip_filename, codec_name, len(mp4_blob))
+    return final_path
+
+
 clips_ns = flask_restx.Namespace(
     "clips",
-    description="Assemble a few posted video frames into an MP4 clip (via ffmpeg) destined for DANDI",
+    description=(
+        "Accept an MP4 clip destined for DANDI, either assembled server-side from a few "
+        "posted video frames (via ffmpeg) or uploaded pre-encoded (vetted via ffprobe)"
+    ),
 )
 
 clip_request = clips_ns.model(
@@ -810,14 +892,27 @@ clip_request = clips_ns.model(
         "video_url": flask_restx.fields.String(required=True),
         "frames": flask_restx.fields.List(
             flask_restx.fields.String,
-            required=True,
+            required=False,
             description=(
                 "Ordered base64-encoded PNG or JPEG frames (bare base64 or data: URLs). "
-                f"All frames must share one format; at most {MAX_CLIP_FRAMES} frames."
+                f"All frames must share one format; at most {MAX_CLIP_FRAMES} frames. "
+                "Provide exactly one of 'frames' or 'mp4'."
+            ),
+        ),
+        "mp4": flask_restx.fields.String(
+            required=False,
+            description=(
+                "A pre-encoded MP4 file as base64 (bare base64 or a data: URL), stored as-is "
+                "after ffprobe confirms it contains a decodable video stream. "
+                "Provide exactly one of 'frames' or 'mp4'; the ffmpeg re-encode parameters "
+                "(fps/codec/crf/width/height) are not accepted alongside 'mp4'."
             ),
         ),
         "fps": flask_restx.fields.Float(
-            required=True, min=CLIP_MIN_FPS, max=CLIP_MAX_FPS, description="Output frame rate"
+            required=False,
+            min=CLIP_MIN_FPS,
+            max=CLIP_MAX_FPS,
+            description="Output frame rate. Required with 'frames'",
         ),
         "codec": flask_restx.fields.String(
             required=False, enum=list(CLIP_CODECS), description=f"Video codec (default {CLIP_DEFAULT_CODEC})"
@@ -856,7 +951,7 @@ class VideoClip(flask_restx.Resource):
     @clips_ns.expect(clip_request, validate=False)
     @clips_ns.marshal_with(clip_response, code=http.HTTPStatus.ACCEPTED)
     def post(self):
-        """Encode posted frames into an MP4 clip and queue it for the next hourly DANDI upload."""
+        """Queue an MP4 clip (assembled from posted frames, or uploaded pre-encoded) for the next hourly DANDI upload."""
         body = flask.request.get_json(silent=True)
         if not isinstance(body, dict):
             raise BadRequest("Request body must be a JSON object")
@@ -868,23 +963,48 @@ class VideoClip(flask_restx.Resource):
         if content_id not in CONTENT_ID_TO_DANDI_PATH:
             raise BadRequest(f"Unknown content_id: {content_id}")
 
-        frame_blobs, frame_extension = decode_clip_frames(body.get("frames"))
-        parameters = parse_clip_encoding_parameters(body)
+        if ("frames" in body) == ("mp4" in body):
+            raise BadRequest("Provide exactly one of 'frames' or 'mp4'")
 
         submission_id = uuid.uuid4().hex
         submitted_by = flask.g.user.get("login") or flask.g.user["sub"]
         hour_tag = datetime.datetime.utcnow().strftime("%Y-%m-%d-%H")
         clip_filename = f"{hour_tag}-{submission_id}.mp4"
 
-        clip_path = write_clip_mp4(
-            frame_blobs=frame_blobs,
-            frame_extension=frame_extension,
-            fps=parameters["fps"],
-            codec=parameters["codec"],
-            crf=parameters["crf"],
-            scale_filter=parameters["scale_filter"],
-            clip_filename=clip_filename,
-        )
+        if "mp4" in body:
+            rejected = [name for name in CLIP_ENCODING_PARAMETER_NAMES if name in body]
+            if rejected:
+                raise BadRequest(
+                    "These parameters are not accepted with a pre-encoded 'mp4' upload "
+                    f"(the clip is stored as-is, never re-encoded): {', '.join(rejected)}"
+                )
+            mp4_blob = decode_clip_mp4(body["mp4"])
+            clip_path = write_uploaded_clip_mp4(mp4_blob=mp4_blob, clip_filename=clip_filename)
+            frame_count = None
+            source_details: dict = {"source": "mp4", "clip_size_bytes": len(mp4_blob)}
+        else:
+            frame_blobs, frame_extension = decode_clip_frames(body.get("frames"))
+            parameters = parse_clip_encoding_parameters(body)
+            clip_path = write_clip_mp4(
+                frame_blobs=frame_blobs,
+                frame_extension=frame_extension,
+                fps=parameters["fps"],
+                codec=parameters["codec"],
+                crf=parameters["crf"],
+                scale_filter=parameters["scale_filter"],
+                clip_filename=clip_filename,
+            )
+            frame_count = len(frame_blobs)
+            source_details = {
+                "source": "frames",
+                "frame_count": frame_count,
+                "frame_format": frame_extension,
+                "fps": parameters["fps"],
+                "codec": parameters["codec"],
+                "crf": parameters["crf"],
+                "width": parameters["width"],
+                "height": parameters["height"],
+            }
 
         # A JSONL provenance record travels alongside the MP4 so the uploaded
         # clip stays attributable to its source video and submitter.
@@ -894,13 +1014,7 @@ class VideoClip(flask_restx.Resource):
             "submitted_by": submitted_by,
             "video_url": video_url,
             "clip_file": clip_path.name,
-            "frame_count": len(frame_blobs),
-            "frame_format": frame_extension,
-            "fps": parameters["fps"],
-            "codec": parameters["codec"],
-            "crf": parameters["crf"],
-            "width": parameters["width"],
-            "height": parameters["height"],
+            **source_details,
             "timestamp": body.get("timestamp"),
         }
         buffer_dir = CLIPS_DANDISET_ROOT / "derivatives" / "buffer"
@@ -911,7 +1025,7 @@ class VideoClip(flask_restx.Resource):
             "content_id": content_id,
             "submission_id": submission_id,
             "clip_file": clip_path.name,
-            "frame_count": len(frame_blobs),
+            "frame_count": frame_count,
             "push_status": "queued",
         }, http.HTTPStatus.ACCEPTED
 
@@ -933,6 +1047,7 @@ class Health(flask_restx.Resource):
             "dandiset_yaml_exists": (BBOX_DANDISET_ROOT / "dandiset.yaml").exists(),
             "dandi_bin_exists": pathlib.Path(DANDI_BIN).exists(),
             "ffmpeg_bin_exists": pathlib.Path(FFMPEG_BIN).exists(),
+            "ffprobe_bin_exists": pathlib.Path(FFPROBE_BIN).exists(),
         }
         ok = all(checks.values())
         return {"status": "ok" if ok else "degraded", "checks": checks}, http.HTTPStatus.OK

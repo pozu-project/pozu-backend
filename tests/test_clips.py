@@ -20,10 +20,11 @@ VIDEO_URL = f"https://example.org/videos/{CONTENT_ID}"
 ENDPOINT = "/api/v1/clips"
 ALLOWED_ORIGIN = "https://pozu-project.github.io"
 
-# Magic-byte-correct stand-ins; the ffmpeg step is monkeypatched in these tests,
-# so only the format sniffing needs to see plausible image bytes.
+# Magic-byte-correct stand-ins; the ffmpeg/ffprobe steps are monkeypatched in
+# these tests, so only the format sniffing needs to see plausible bytes.
 FAKE_PNG = pozu_flask_app.PNG_MAGIC + b"\x00" * 16
 FAKE_JPEG = pozu_flask_app.JPEG_MAGIC + b"\xe0" + b"\x00" * 16
+FAKE_MP4 = b"\x00\x00\x00\x18" + pozu_flask_app.MP4_FTYP_TAG + b"isom" + b"\x00" * 16
 
 
 def _b64(blob, /):
@@ -39,19 +40,15 @@ def _png_bytes(*, width=8, height=8):
 
     header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
     raw = b"".join(b"\x00" + b"\x7f\x20\xd0" * width for _ in range(height))
-    return (
-        pozu_flask_app.PNG_MAGIC
-        + chunk(b"IHDR", header)
-        + chunk(b"IDAT", zlib.compress(raw))
-        + chunk(b"IEND", b"")
-    )
+    return pozu_flask_app.PNG_MAGIC + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
 
 
 @pytest.fixture
 def captured(monkeypatch):
-    """Capture buffered records and encoded clips, instead of touching disk or ffmpeg."""
+    """Capture buffered records, encoded clips, and direct uploads, instead of touching disk or ffmpeg."""
     records = []
     clips = []
+    uploads = []
     monkeypatch.setattr(pozu_flask_app, "APP_SECRET_KEY", APP_SECRET)
     monkeypatch.setattr(
         pozu_flask_app,
@@ -63,8 +60,13 @@ def captured(monkeypatch):
         clips.append(kwargs)
         return pathlib.Path("clips") / kwargs["clip_filename"]
 
+    def fake_write_uploaded_clip_mp4(**kwargs):
+        uploads.append(kwargs)
+        return pathlib.Path("clips") / kwargs["clip_filename"]
+
     monkeypatch.setattr(pozu_flask_app, "write_clip_mp4", fake_write_clip_mp4)
-    return records, clips
+    monkeypatch.setattr(pozu_flask_app, "write_uploaded_clip_mp4", fake_write_uploaded_clip_mp4)
+    return records, clips, uploads
 
 
 @pytest.fixture
@@ -108,7 +110,7 @@ def test_unauthorized_response_carries_cors_header(client):
 
 @pytest.mark.ai_generated
 def test_accepts_valid_clip(client, captured):
-    records, clips = captured
+    records, clips, _ = captured
     response = client.post(ENDPOINT, json=_clip_body(), headers=_auth_headers())
 
     assert response.status_code == http.HTTPStatus.ACCEPTED
@@ -147,7 +149,7 @@ def test_accepts_valid_clip(client, captured):
     ],
 )
 def test_accepts_alternate_frame_encodings(client, captured, frames, expected_extension):
-    _, clips = captured
+    _, clips, _ = captured
     response = client.post(ENDPOINT, json=_clip_body(frames=frames), headers=_auth_headers())
 
     assert response.status_code == http.HTTPStatus.ACCEPTED
@@ -156,7 +158,7 @@ def test_accepts_alternate_frame_encodings(client, captured, frames, expected_ex
 
 @pytest.mark.ai_generated
 def test_explicit_dimensions_produce_scale_filter(client, captured):
-    _, clips = captured
+    _, clips, _ = captured
     body = _clip_body(width=640, height=480, codec="libx265", crf=30)
     response = client.post(ENDPOINT, json=body, headers=_auth_headers())
 
@@ -214,7 +216,7 @@ def _set(**overrides):
     ],
 )
 def test_invalid_payloads_are_rejected(client, captured, mutate, message_snippet):
-    records, clips = captured
+    records, clips, uploads = captured
     body = _clip_body()
     mutate(body)
 
@@ -224,11 +226,12 @@ def test_invalid_payloads_are_rejected(client, captured, mutate, message_snippet
     assert message_snippet in response.get_json()["message"]
     assert records == []
     assert clips == []
+    assert uploads == []
 
 
 @pytest.mark.ai_generated
 def test_oversized_frame_is_rejected(client, captured, monkeypatch):
-    records, clips = captured
+    records, clips, _ = captured
     monkeypatch.setattr(pozu_flask_app, "MAX_CLIP_FRAME_BYTES", 8)
 
     response = client.post(ENDPOINT, json=_clip_body(), headers=_auth_headers())
@@ -237,6 +240,93 @@ def test_oversized_frame_is_rejected(client, captured, monkeypatch):
     assert "per-frame limit" in response.get_json()["message"]
     assert records == []
     assert clips == []
+
+
+def _mp4_body(**overrides):
+    """A minimally valid pre-encoded MP4 upload payload."""
+    body = {
+        "video_url": VIDEO_URL,
+        "mp4": _b64(FAKE_MP4),
+    }
+    body.update(overrides)
+    return body
+
+
+@pytest.mark.ai_generated
+@pytest.mark.parametrize(
+    "mp4_value",
+    [
+        pytest.param(_b64(FAKE_MP4), id="bare-base64"),
+        pytest.param(f"data:video/mp4;base64,{_b64(FAKE_MP4)}", id="data-url"),
+    ],
+)
+def test_accepts_uploaded_mp4(client, captured, mp4_value):
+    records, clips, uploads = captured
+    response = client.post(ENDPOINT, json=_mp4_body(mp4=mp4_value), headers=_auth_headers())
+
+    assert response.status_code == http.HTTPStatus.ACCEPTED
+    payload = response.get_json()
+    assert payload["push_status"] == "queued"
+    assert payload["content_id"] == CONTENT_ID
+    assert payload["frame_count"] is None
+    assert payload["clip_file"].endswith(".mp4")
+
+    assert clips == []
+    assert len(uploads) == 1
+    assert uploads[0]["mp4_blob"] == FAKE_MP4
+
+    record, buffer_dir = records[0]
+    assert record["source"] == "mp4"
+    assert record["clip_size_bytes"] == len(FAKE_MP4)
+    assert record["submitted_by"] == "octocat"
+    assert buffer_dir == pozu_flask_app.CLIPS_DANDISET_ROOT / "derivatives" / "buffer"
+
+
+@pytest.mark.ai_generated
+def test_frames_record_carries_source(client, captured):
+    records, _, _ = captured
+    response = client.post(ENDPOINT, json=_clip_body(), headers=_auth_headers())
+
+    assert response.status_code == http.HTTPStatus.ACCEPTED
+    record, _ = records[0]
+    assert record["source"] == "frames"
+
+
+@pytest.mark.ai_generated
+@pytest.mark.parametrize(
+    ("body_factory", "message_snippet"),
+    [
+        pytest.param(lambda: _clip_body(mp4=_b64(FAKE_MP4)), "exactly one", id="frames-and-mp4"),
+        pytest.param(lambda: {"video_url": VIDEO_URL}, "exactly one", id="neither-frames-nor-mp4"),
+        pytest.param(lambda: _mp4_body(fps=10), "not accepted", id="fps-with-mp4"),
+        pytest.param(lambda: _mp4_body(codec="libx264", crf=23), "not accepted", id="codec-and-crf-with-mp4"),
+        pytest.param(lambda: _mp4_body(mp4=12345), "base64-encoded string", id="mp4-not-a-string"),
+        pytest.param(lambda: _mp4_body(mp4="!!! not base64 !!!"), "base64", id="mp4-invalid-base64"),
+        pytest.param(lambda: _mp4_body(mp4=_b64(b"\x00" * 32)), "ftyp", id="mp4-missing-ftyp"),
+    ],
+)
+def test_invalid_mp4_payloads_are_rejected(client, captured, body_factory, message_snippet):
+    records, clips, uploads = captured
+    response = client.post(ENDPOINT, json=body_factory(), headers=_auth_headers())
+
+    assert response.status_code == http.HTTPStatus.BAD_REQUEST
+    assert message_snippet in response.get_json()["message"]
+    assert records == []
+    assert clips == []
+    assert uploads == []
+
+
+@pytest.mark.ai_generated
+def test_oversized_mp4_is_rejected(client, captured, monkeypatch):
+    records, _, uploads = captured
+    monkeypatch.setattr(pozu_flask_app, "MAX_CLIP_MP4_BYTES", 8)
+
+    response = client.post(ENDPOINT, json=_mp4_body(), headers=_auth_headers())
+
+    assert response.status_code == http.HTTPStatus.BAD_REQUEST
+    assert "byte limit" in response.get_json()["message"]
+    assert records == []
+    assert uploads == []
 
 
 requires_ffmpeg = pytest.mark.skipif(
@@ -285,4 +375,45 @@ def test_write_clip_mp4_rejects_corrupt_frames(tmp_path, monkeypatch):
 
     buffer_dir = tmp_path / "000474" / "derivatives" / "buffer"
     # Nothing (not even a .part file) is left behind after a failed encode.
+    assert list(buffer_dir.iterdir()) == []
+
+
+@pytest.mark.ai_generated
+@requires_ffmpeg
+def test_write_uploaded_clip_mp4_accepts_real_video(tmp_path, monkeypatch):
+    monkeypatch.setattr(pozu_flask_app, "CLIPS_DANDISET_ROOT", tmp_path / "000474")
+
+    # Produce a genuine MP4 with the frames pipeline, then round-trip its bytes
+    # through the direct-upload path as a client would.
+    encoded_path = pozu_flask_app.write_clip_mp4(
+        frame_blobs=[_png_bytes() for _ in range(4)],
+        frame_extension="png",
+        fps=4.0,
+        codec="libx264",
+        crf=23,
+        scale_filter=pozu_flask_app.CLIP_DEFAULT_SCALE_FILTER,
+        clip_filename="source-clip.mp4",
+    )
+    mp4_blob = encoded_path.read_bytes()
+    encoded_path.unlink()
+
+    clip_path = pozu_flask_app.write_uploaded_clip_mp4(mp4_blob=mp4_blob, clip_filename="uploaded-clip.mp4")
+
+    buffer_dir = tmp_path / "000474" / "derivatives" / "buffer"
+    assert clip_path == buffer_dir / "uploaded-clip.mp4"
+    assert clip_path.read_bytes() == mp4_blob
+    # No .part staging file or scratch bytes are left behind.
+    assert sorted(entry.name for entry in buffer_dir.iterdir()) == ["uploaded-clip.mp4"]
+
+
+@pytest.mark.ai_generated
+@requires_ffmpeg
+def test_write_uploaded_clip_mp4_rejects_ftyp_wearing_junk(tmp_path, monkeypatch):
+    monkeypatch.setattr(pozu_flask_app, "CLIPS_DANDISET_ROOT", tmp_path / "000474")
+
+    # Passes the magic-byte sniff but ffprobe finds no decodable video stream.
+    with pytest.raises(pozu_flask_app.BadRequest):
+        pozu_flask_app.write_uploaded_clip_mp4(mp4_blob=FAKE_MP4, clip_filename="junk-clip.mp4")
+
+    buffer_dir = tmp_path / "000474" / "derivatives" / "buffer"
     assert list(buffer_dir.iterdir()) == []

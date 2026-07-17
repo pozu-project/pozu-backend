@@ -33,11 +33,14 @@ from a bash console.
 
 ### Video clips (ffmpeg)
 
-`POST /api/v1/clips` accepts a few base64-encoded PNG or JPEG frames plus encoding parameters (`fps`, optional `codec`, `crf`, `width`/`height`). The server assembles them into an MP4 with `ffmpeg` and queues it in dandiset `000474` for the hourly DANDI upload.
+`POST /api/v1/clips` queues an MP4 clip in dandiset `000474` for the hourly DANDI upload. It accepts exactly one of two payload shapes.
+
+-   `frames` plus encoding parameters (`fps`, optional `codec`, `crf`, `width`/`height`). A few base64-encoded PNG or JPEG frames that the server assembles into an MP4 with `ffmpeg`.
+-   `mp4`. A small pre-encoded MP4 file as base64, stored as-is. The server verifies it with `ffprobe` (it must contain a decodable video stream) before accepting it, and the re-encode parameters above are rejected alongside it since nothing is re-encoded.
 
 The frames and the in-progress MP4 are written to a temporary directory that is always deleted, even on failure. After `cron_snapshot.py` uploads a clip successfully, the local MP4 is deleted as well, so clips never accumulate on the PythonAnywhere disk. The DANDI archive is their system of record.
 
-Requirements on the deployment. `ffmpeg` must be installed (PythonAnywhere ships it at `/usr/bin/ffmpeg`; override with the `FFMPEG_BIN` env var if needed) and dandiset `000474` must be provisioned at `/home/CodyCBakerPhD/mysite/000474` (a `dandiset.yaml` plus a `derivatives/` tree) the same way as the other dandisets. The `/api/v1/health` endpoint reports whether the `ffmpeg` binary is present.
+Requirements on the deployment. `ffmpeg` and `ffprobe` must be installed (PythonAnywhere ships them at `/usr/bin/ffmpeg` and `/usr/bin/ffprobe`; override with the `FFMPEG_BIN` / `FFPROBE_BIN` env vars if needed) and dandiset `000474` must be provisioned at `/home/CodyCBakerPhD/mysite/000474` (a `dandiset.yaml` plus a `derivatives/` tree) the same way as the other dandisets. The `/api/v1/health` endpoint reports whether both binaries are present.
 
 ### GitHub OAuth
 
