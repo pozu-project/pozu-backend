@@ -313,20 +313,17 @@ def test_upload_clip_to_dandi_deletes_local_copies_on_success(staged_clip_paths,
 
     pozu_flask_app.upload_clip_to_dandi(staged_clip_paths)
 
-    assert commands == [
-        (
-            [
-                pozu_flask_app.DANDI_BIN,
-                "upload",
-                "--allow-any-path",
-                "--validation",
-                "skip",
-                "--dandi-instance",
-                pozu_flask_app.DANDI_INSTANCE,
-            ],
-            pozu_flask_app.CLIPS_DANDISET_ROOT,
-        )
-    ]
+    assert len(commands) == 1
+    cmd, cwd = commands[0]
+    assert cwd == pozu_flask_app.CLIPS_DANDISET_ROOT
+    # The upload runs the dandi Python API (not the CLI) so allow_any_path can
+    # be set, which the CLI does not expose; without it the .json sidecar is
+    # silently skipped.
+    assert cmd[0] == pozu_flask_app.VENV_PYTHON
+    assert cmd[-1] == pozu_flask_app.DANDI_INSTANCE
+    script = cmd[2]
+    assert "allow_any_path=True" in script
+    assert "UploadValidation.SKIP" in script
     # No local copies survive the upload.
     assert all(not path.exists() for path in staged_clip_paths)
 
