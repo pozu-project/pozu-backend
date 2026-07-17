@@ -151,6 +151,36 @@ def test_invalid_payloads_are_rejected(client, captured, overrides, message_snip
 
 
 @pytest.mark.ai_generated
+@pytest.mark.parametrize(
+    ("provided", "recorded"),
+    [
+        pytest.param(None, None, id="omitted"),
+        pytest.param("my recording.mp4", "my recording.mp4", id="plain-name"),
+        pytest.param("../../etc/passwd", "passwd", id="path-components-stripped"),
+        pytest.param("C:\\videos\\clip.mp4", "clip.mp4", id="windows-path-stripped"),
+    ],
+)
+def test_filename_is_recorded_in_provenance(client, captured, provided, recorded):
+    written, _ = captured
+    body = _clip_body() if provided is None else _clip_body(filename=provided)
+
+    response = client.post(ENDPOINT, json=body, headers=_auth_headers())
+
+    assert response.status_code == http.HTTPStatus.CREATED
+    assert written[0]["record"]["filename"] == recorded
+
+
+@pytest.mark.ai_generated
+def test_blank_filename_is_rejected(client, captured):
+    written, _ = captured
+    response = client.post(ENDPOINT, json=_clip_body(filename="   "), headers=_auth_headers())
+
+    assert response.status_code == http.HTTPStatus.BAD_REQUEST
+    assert "filename" in response.get_json()["message"]
+    assert written == []
+
+
+@pytest.mark.ai_generated
 def test_oversized_mp4_is_rejected(client, captured, monkeypatch):
     written, uploaded = captured
     monkeypatch.setattr(pozu_flask_app, "MAX_CLIP_MP4_BYTES", 8)
@@ -203,7 +233,14 @@ def test_upload_clip_to_dandi_deletes_local_copies_on_success(staged_clip_paths,
 
     assert commands == [
         (
-            [pozu_flask_app.DANDI_BIN, "upload", "--dandi-instance", pozu_flask_app.DANDI_INSTANCE],
+            [
+                pozu_flask_app.DANDI_BIN,
+                "upload",
+                "--validation",
+                "skip",
+                "--dandi-instance",
+                pozu_flask_app.DANDI_INSTANCE,
+            ],
             pozu_flask_app.CLIPS_DANDISET_ROOT,
         )
     ]

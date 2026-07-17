@@ -744,7 +744,9 @@ def upload_clip_to_dandi(clip_paths, /) -> None:
     env = os.environ.copy()
     env["EMBER_DANDI_API_KEY"] = EMBER_DANDI_API_KEY
     env["PATH"] = f"{VENV_BIN}:{env.get('PATH', '')}"
-    cmd = [DANDI_BIN, "upload", "--dandi-instance", DANDI_INSTANCE]
+    # The MP4 and its JSON sidecar are not NWB assets, so DANDI's asset
+    # validation must be skipped for the pair to upload.
+    cmd = [DANDI_BIN, "upload", "--validation", "skip", "--dandi-instance", DANDI_INSTANCE]
     lock_path = CLIPS_DANDISET_ROOT / "derivatives" / "upload.lock"
     try:
         with filelock.FileLock(lock_path, timeout=DANDI_UPLOAD_TIMEOUT_SECONDS):
@@ -792,6 +794,10 @@ clip_request = clips_ns.model(
                 f"At most {MAX_CLIP_MP4_BYTES} bytes decoded."
             ),
         ),
+        "filename": flask_restx.fields.String(
+            required=False,
+            description="Original name of the video file, recorded in the provenance sidecar",
+        ),
         "timestamp": flask_restx.fields.String(required=False),
     },
 )
@@ -824,6 +830,14 @@ class VideoClip(flask_restx.Resource):
 
         mp4_blob = decode_clip_mp4(body.get("mp4"))
 
+        filename = body.get("filename")
+        if filename is not None:
+            if not isinstance(filename, str) or not filename.strip():
+                raise BadRequest("'filename' must be a non-empty string when provided")
+            # Provenance only; strip any path components so the sidecar never
+            # carries traversal-looking values.
+            filename = pathlib.PurePosixPath(filename.replace("\\", "/")).name[:255]
+
         submission_id = uuid.uuid4().hex
         submitted_by = resolve_optional_identity()
         hour_tag = datetime.datetime.utcnow().strftime("%Y-%m-%d-%H")
@@ -832,6 +846,7 @@ class VideoClip(flask_restx.Resource):
         record: dict = {
             "submission_id": submission_id,
             "submitted_by": submitted_by,
+            "filename": filename,
             "clip_file": clip_filename,
             "clip_size_bytes": len(mp4_blob),
             "timestamp": body.get("timestamp"),
