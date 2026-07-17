@@ -692,8 +692,22 @@ def write_clip_files(*, mp4_blob, record, clip_filename) -> list[pathlib.Path]:
     upload_dir = CLIPS_DANDISET_ROOT / "derivatives" / "incoming"
     upload_dir.mkdir(parents=True, exist_ok=True)
 
+    # clip_filename derives from the user-supplied 'filename'. The endpoint
+    # already sanitizes it, but normalize the joined path and require it to stay
+    # inside the upload directory before any filesystem use (defense in depth,
+    # and the containment proof CodeQL recognizes).
+    normalized = os.path.normpath(os.path.join(str(upload_dir), clip_filename))
+    if not normalized.startswith(str(upload_dir) + os.sep) or not normalized.endswith(".mp4"):
+        raise BadRequest("'filename' produces an invalid clip name")
+    final_path = pathlib.Path(normalized)
+    # The sidecar shares the clip's name so the pair sit side by side in the
+    # archive (X.mp4 + X.json); the .part name stages the atomic rename.
+    sidecar_path = final_path.parent / (final_path.stem + ".json")
+    partial_path = final_path.parent / (final_path.name + ".part")
+
     with tempfile.TemporaryDirectory(prefix="pozu-clip-") as tmp:
-        tmp_output = pathlib.Path(tmp) / clip_filename
+        # Fixed internal name: the user-derived value never reaches ffprobe's argv.
+        tmp_output = pathlib.Path(tmp) / "clip.mp4"
         tmp_output.write_bytes(mp4_blob)
 
         cmd = [
@@ -719,13 +733,9 @@ def write_clip_files(*, mp4_blob, record, clip_filename) -> list[pathlib.Path]:
             raise BadRequest("'mp4' is not a decodable video: " + " | ".join(stderr_tail or ["no video stream found"]))
 
         # The sidecar keeps the uploaded clip attributable to its source video
-        # and submitter without a separate JSONL buffer. It shares the clip's
-        # name so the pair sit side by side in the archive (X.mp4 + X.json).
-        sidecar_path = upload_dir / (clip_filename.removesuffix(".mp4") + ".json")
+        # and submitter without a separate JSONL buffer.
         sidecar_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-        partial_path = upload_dir / f"{clip_filename}.part"
-        final_path = upload_dir / clip_filename
         shutil.move(str(tmp_output), str(partial_path))
         partial_path.replace(final_path)
 
